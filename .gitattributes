@@ -1,0 +1,3 @@
+# The tree builds on both Windows (MinGW-w64) and Linux (WSL); keep every
+# text file LF so the two checkouts stay byte-identical.
+* text=auto eol=lf

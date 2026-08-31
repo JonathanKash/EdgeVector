@@ -1,0 +1,10 @@
+# Build artifacts (debug and release test binaries)
+tests/*.exe
+tests/test_quantize_math
+tests/test_mmap_storage
+tests/test_hnsw_graph
+tests/test_integration
+tests/*_release
+
+# Transient index files a crashed test run might leave behind
+tests/ev_test_*.evec
