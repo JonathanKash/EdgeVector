@@ -1,5 +1,7 @@
 # EdgeVector
 
+[![CI](https://github.com/JonathanKash/EdgeVector/actions/workflows/ci.yml/badge.svg)](https://github.com/JonathanKash/EdgeVector/actions/workflows/ci.yml)
+
 A header-only C++17 vector search library for edge devices: **binary
 quantization + HNSW + memory-mapped storage** in three headers, ~2,000 lines,
 zero dependencies — with a two-stage retrieval pipeline that reaches
@@ -34,10 +36,11 @@ zero dependencies — with a two-stage retrieval pipeline that reaches
 - **Learned ITQ rotation** for anisotropic (real-embedding-shaped) data:
   +21 recall points at the same beam width, or the same accuracy at a
   fraction of the compute — while preserving cosine exactly
-- **Validated on Linux (POSIX mmap), Windows (MinGW-w64), and AArch64**
-  (all suites pass under QEMU emulation with native arm64 g++; the Hamming
-  kernel compiles to NEON `cnt`), debug and `-DNDEBUG` release, always under
-  `-O3 -Wall -Wextra -Werror`
+- **CI-validated on every push** across Linux gcc + clang, Windows
+  (MinGW-w64), and **native arm64 silicon** — where the benchmark runs on
+  real ARM hardware: 0.995 float-recall at 166 µs/query (~6,000 QPS,
+  1 thread) — plus ASan/UBSan on all suites and **ThreadSanitizer on the
+  concurrent build**, debug and `-DNDEBUG`, always `-Wall -Wextra -Werror`
 
 ## The accuracy architecture
 
@@ -356,12 +359,13 @@ hostile-file rejection, end-to-end recall gain), concurrent construction
 the full referential-integrity sweep and the recall gate), and the
 zero-allocation proof for all three search modes.
 
-**AArch64:** `tests/arm64.Dockerfile` reproduces the ARM validation — all
-five suites compiled by native arm64 g++ 13 at `-march=armv8-a -Werror` and
-executed under QEMU user-mode emulation, with the Hamming kernel confirmed to
-compile to NEON `cnt` (vector popcount) instructions. Emulated timings are
-meaningless, so ARM *performance* claims wait for real silicon; correctness —
-including bit-identical ITQ training results vs x86-64 — is validated.
+**AArch64:** validated on **real arm64 silicon** in CI on every push (the
+Hamming kernel compiles to NEON `cnt`), with the clustered benchmark run on
+hardware and uploaded as an artifact. Measured there (4-core runner, single-
+thread queries): 0.995 float-exact recall@10 at 166 µs/query, 4-thread build
+of 100k vectors in 9.5 s, slot reclaim 1.8 ms, graph load 0.018 s — and every
+recall figure bit-identical to x86-64. `tests/arm64.Dockerfile` reproduces
+the ARM run locally under QEMU when no ARM hardware is at hand.
 
 ## Status and roadmap
 
@@ -375,13 +379,7 @@ v0.8. Known limitations, in priority order:
    an mmap'ed block means writing and remapping a larger file
 2. **Highly selective filters degrade** toward a scan of the reachable graph
    (true of every filtered-HNSW implementation; documented, not hidden)
-3. **ARM validated for correctness, not yet for performance** — all suites
-   pass on aarch64 under QEMU emulation (including the 4-thread build and
-   query tests) with NEON popcount codegen confirmed, but latency/QPS
-   numbers on real ARM silicon are still pending; QEMU on an x86 host also
-   only partially exercises ARM's weaker memory model (the build's
-   correctness rests on mutex ordering, not x86 TSO, by design)
-4. **Parallel builds are nondeterministic** in link structure (insertion
+3. **Parallel builds are nondeterministic** in link structure (insertion
    order interleaves); use serial `insert()` or `insert_batch(..., 1)` when
    bit-reproducible graphs matter
 

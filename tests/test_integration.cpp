@@ -27,7 +27,8 @@
 
 // Counting operator new (same shim as test_hnsw_graph.cpp): proves the search
 // path stays allocation-free when reading vectors straight out of the mapping.
-static std::size_t g_new_calls = 0;
+#include <atomic>
+static std::atomic<std::size_t> g_new_calls{0};
 
 // See test_hnsw_graph.cpp: GCC 13+'s -Wmismatched-new-delete misfires on the
 // canonical malloc/free allocator replacement; silenced for the shim only.

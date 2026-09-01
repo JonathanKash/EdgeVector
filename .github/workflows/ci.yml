@@ -1,0 +1,103 @@
+# EdgeVector CI: the full validation matrix on every push/PR.
+#
+# Six jobs: Linux gcc, Linux clang, native arm64 (real ARM silicon - also
+# runs the clustered benchmark so ARM performance numbers are measured, not
+# emulated), Windows MinGW, ASan+UBSan, and TSan on the concurrency suite.
+# Every suite runs in both the assert-enabled and -DNDEBUG configurations.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux-gcc:
+    name: Linux x86-64 (gcc)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test (debug)
+        run: make -C tests run
+      - name: Test (release, -DNDEBUG)
+        run: make -C tests run-release
+
+  linux-clang:
+    name: Linux x86-64 (clang)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test (debug)
+        run: make -C tests run CXX=clang++
+      - name: Test (release, -DNDEBUG)
+        run: make -C tests run-release CXX=clang++
+
+  linux-arm64:
+    name: Linux arm64 (native silicon)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test (debug)
+        run: make -C tests run
+      - name: Test (release, -DNDEBUG)
+        run: make -C tests run-release
+      - name: Benchmark on real ARM silicon (clustered scenario)
+        run: |
+          make -C tests benchmark_100k
+          cd tests && ./benchmark_100k clustered | tee bench_arm64.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-arm64
+          path: tests/bench_arm64.md
+
+  windows-mingw:
+    name: Windows (MinGW-w64)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: mingw-w64-ucrt-x86_64-gcc make
+      - name: Test (debug)
+        run: make -C tests run
+      - name: Test (release, -DNDEBUG)
+        run: make -C tests run-release
+
+  asan-ubsan:
+    name: ASan + UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test under AddressSanitizer + UndefinedBehaviorSanitizer
+        run: >
+          make -C tests run
+          CXXFLAGS="-std=c++17 -O1 -g -march=native
+          -fsanitize=address,undefined -fno-sanitize-recover=all
+          -Wall -Wextra -Werror"
+
+  tsan:
+    name: ThreadSanitizer (concurrent build + queries)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lower ASLR entropy (TSan is incompatible with 32-bit mmap_rnd_bits)
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: HNSW suite under ThreadSanitizer
+        run: |
+          cd tests
+          g++ -std=c++17 -O1 -g -march=native -fsanitize=thread \
+              -Wall -Wextra -Werror -I../include \
+              test_hnsw_graph.cpp -o test_hnsw_graph_tsan
+          ./test_hnsw_graph_tsan
