@@ -134,6 +134,51 @@ precision, spectrally pre-scaled) reports failure rather than silently
 degrading. The `EVRT` rotation file format validates magic, version,
 dimension, exact length, finiteness, and orthogonality on load.
 
+## When EdgeVector is the right choice — even over Faiss
+
+Each of these maps to a property this repo demonstrates, not a marketing
+claim. The pattern: EdgeVector wins wherever **trust, footprint, or
+portability constraints dominate raw throughput**.
+
+1. **Regulated / certified firmware** (IEC 62304 medical, ISO 26262
+   automotive, aerospace, industrial safety) — the strongest case. Every
+   third-party line must be reviewed and justified; a dependency is a
+   certification liability. This is ~2,600 vendorable lines with no
+   exceptions on the query path, no allocation after load (*proven* by
+   instrumented tests — the kind of evidence a safety review wants), and
+   every file format validated against corrupt input. Faiss brings BLAS,
+   OpenMP, and a build system to that meeting.
+2. **Hard-real-time query paths** (robotics control loops, audio pipelines)
+   where a malloc-induced latency spike or an allocator lock is a
+   correctness bug. The zero-allocation, zero-syscall, `noexcept` search is
+   a tested contract here, not a happenstance. (Caveat: kernels are
+   compiler-vectorized, not hand-tuned SIMD — profile if you need peak
+   throughput too.)
+3. **Fleet devices that reboot often on tiny RAM budgets** (smart cameras,
+   retail edge boxes, on-device RAG caches): mmap the 64 B/vector codes,
+   load the prebuilt graph in ~0.05 s, keep float vectors on flash and touch
+   only ~ef of them per query — a ~6 MB working set at 100k × 512-d with
+   float-exact results.
+4. **Air-gapped and supply-chain-sensitive builds**: vendor four headers and
+   the entire supply chain is the diff you reviewed — no package manager,
+   no transitive CVE feed.
+5. **Exotic toolchain targets** (WASM, RTOS, unikernels): header-only C++17
+   with the platform layer confined to one file, and the graph works over
+   any in-memory block if mmap does not exist at all.
+6. **Teaching, research baselines, and forkable foundations**: modifying
+   2,600 documented lines guarded by recall, integrity, and allocation gates
+   beats reverse-engineering a large library's internals, and the published
+   adversarial benchmark makes it a clean experimental control.
+
+**When to say no:** server-side workloads with big RAM, GPUs, billions of
+vectors, or a need for bindings and ops tooling — use
+[Faiss](https://github.com/facebookresearch/faiss),
+[USearch](https://github.com/unum-cloud/usearch), or a vector database. And
+across all six cases above: ARM is validated for correctness, not yet
+performance — run `make -C tests bench` on your actual silicon (the
+Makefile's `ARCH`/`RUNNER` knobs make that a ten-minute job) before
+committing a product.
+
 ## Quick start
 
 Everything is three `#include`s; no linking, no build step for the library
