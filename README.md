@@ -1,5 +1,7 @@
 # EdgeVector
 
+[![CI](https://github.com/JonathanKash/EdgeVector/actions/workflows/ci.yml/badge.svg)](https://github.com/JonathanKash/EdgeVector/actions/workflows/ci.yml)
+
 A header-only C++17 vector search library for edge devices: **binary
 quantization + HNSW + memory-mapped storage** in three headers, ~2,000 lines,
 zero dependencies — with a two-stage retrieval pipeline that reaches

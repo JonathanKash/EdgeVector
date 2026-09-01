@@ -29,9 +29,11 @@
 // ---------------------------------------------------------------------------
 // Global allocation counter. Every path into the C++ free store goes through
 // these replacements, so a zero delta across search() calls is hard evidence
-// of a zero-allocation query path, not a code-reading claim.
+// of a zero-allocation query path, not a code-reading claim. Atomic because
+// worker threads allocate (their contexts) during concurrent-build tests.
 // ---------------------------------------------------------------------------
-static std::size_t g_new_calls = 0;
+#include <atomic>
+static std::atomic<std::size_t> g_new_calls{0};
 
 // The malloc/free pairing below is the canonical way to replace the global
 // allocator; GCC 13+'s -Wmismatched-new-delete cannot see that these are the
