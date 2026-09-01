@@ -549,10 +549,148 @@ void run_itq_scenario() {
     std::fflush(stdout);
 }
 
+// ---------------------------------------------------------------------------
+// 1M-vector scale scenario: clustered data, multi-threaded build, and the
+// recall/latency sweep against exact binary ground truth. Float32 ground
+// truth is omitted at this scale (it would need 2 GB of float residents);
+// the 100k scenario above carries the float-truth accuracy story, this one
+// carries the scale story.
+// ---------------------------------------------------------------------------
+void run_million_scenario() {
+    const std::size_t n = 1000000;
+    const std::size_t n_queries = 1000;
+    std::printf("## Scenario: 1M vectors (clustered, %zu queries)\n\n",
+                n_queries);
+    std::fflush(stdout);
+
+    Sampler sampler(true);
+    std::vector<float> raw(kDim);
+    RecordBlock data(kDim, n);
+    Clock::time_point t0 = Clock::now();
+    for (std::size_t i = 0; i < n; ++i) {
+        sampler.draw(raw.data());
+        edgevector::quantize(raw.data(), kDim, data.record(i));
+    }
+    std::printf("Dataset generated and quantized in %.1f s.\n\n",
+                seconds_since(t0));
+    std::fflush(stdout);
+
+    edgevector::HNSWGraph graph(data.base(), data.record_bytes(), kDim,
+                                static_cast<std::uint32_t>(n),
+                                /*m=*/16u, /*ef_construction=*/200u,
+                                /*max_ef_search=*/256u, /*seed=*/42u);
+    unsigned hw_threads = 1u;
+#if defined(EDGEVECTOR_HAS_THREADS)
+    hw_threads = std::thread::hardware_concurrency();
+    if (hw_threads == 0u) {
+        hw_threads = 1u;
+    }
+#endif
+    {
+        std::vector<std::uint32_t> ids(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            ids[i] = static_cast<std::uint32_t>(i);
+        }
+        t0 = Clock::now();
+        const std::size_t inserted =
+            graph.insert_batch(ids.data(), n, hw_threads);
+        const double build_s = seconds_since(t0);
+        const bool ok = (inserted == n) && graph.validate_integrity();
+        std::printf("| Stage | Value |\n|---|---|\n");
+        std::printf("| Build, insert_batch (%u threads) | %.1f s (integrity %s) |\n",
+                    hw_threads, build_s, ok ? "validated" : "FAILED");
+    }
+
+    const char* const kGraphFile = "ev_bench_graph_1m.evhg";
+    t0 = Clock::now();
+    if (graph.save_graph(kGraphFile) != edgevector::GraphIoStatus::ok) {
+        std::printf("FATAL: save_graph failed\n");
+        std::exit(1);
+    }
+    const double save_s = seconds_since(t0);
+    edgevector::HNSWGraph loaded(data.base(), data.record_bytes(), kDim,
+                                 static_cast<std::uint32_t>(n),
+                                 16u, 200u, 256u, 42u);
+    t0 = Clock::now();
+    if (loaded.load_graph(kGraphFile) != edgevector::GraphIoStatus::ok) {
+        std::printf("FATAL: load_graph failed\n");
+        std::exit(1);
+    }
+    const double load_s = seconds_since(t0);
+    std::remove(kGraphFile);
+    std::printf("| Save / load graph | %.2f s / %.2f s |\n", save_s, load_s);
+    std::printf("| Quantized vectors (RAM) | %.1f MB (float32 equivalent: %.1f MB) |\n",
+                static_cast<double>(n * edgevector::padded_bytes(kDim)) / 1.0e6,
+                static_cast<double>(n * kDim * sizeof(float)) / 1.0e6);
+    std::printf("| Graph (links + scratch) | %.1f MB |\n\n",
+                static_cast<double>(loaded.graph_memory_bytes()) / 1.0e6);
+    std::fflush(stdout);
+
+    // Queries + exact binary ground truth.
+    std::vector<std::uint64_t> qwords(
+        (edgevector::padded_bytes(kDim) / 8u) * n_queries, 0u);
+    std::uint8_t* qbase = reinterpret_cast<std::uint8_t*>(qwords.data());
+    const std::size_t qstride = edgevector::padded_bytes(kDim);
+    for (std::size_t qi = 0; qi < n_queries; ++qi) {
+        sampler.draw(raw.data());
+        edgevector::quantize(raw.data(), kDim, qbase + qi * qstride);
+    }
+    std::vector<std::uint32_t> truth(n_queries * kK);
+    t0 = Clock::now();
+    {
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> all(n);
+        for (std::size_t qi = 0; qi < n_queries; ++qi) {
+            const std::uint8_t* q = qbase + qi * qstride;
+            for (std::size_t i = 0; i < n; ++i) {
+                all[i] = std::make_pair(
+                    edgevector::hamming_distance(q, data.record(i), kDim),
+                    static_cast<std::uint32_t>(i));
+            }
+            std::partial_sort(all.begin(), all.begin() + kK, all.end());
+            for (std::size_t i = 0; i < kK; ++i) {
+                truth[qi * kK + i] = all[i].second;
+            }
+        }
+    }
+    const double brute_s = seconds_since(t0);
+    std::printf("Exact binary scan baseline: %.2f ms/query (%.0f QPS).\n\n",
+                1000.0 * brute_s / static_cast<double>(n_queries),
+                static_cast<double>(n_queries) / brute_s);
+
+    std::printf("| ef | recall@10 (binary GT) | mean latency | QPS (1 thread) |\n");
+    std::printf("|---|---|---|---|\n");
+    const std::uint32_t ef_sweep[] = {10u, 50u, 100u};
+    std::vector<edgevector::SearchResult> results(kK);
+    std::uint32_t got_ids[kK];
+    for (const std::uint32_t ef : ef_sweep) {
+        std::size_t hits = 0;
+        t0 = Clock::now();
+        for (std::size_t qi = 0; qi < n_queries; ++qi) {
+            const std::uint32_t found = loaded.search(
+                qbase + qi * qstride, kK, ef, results.data());
+            for (std::uint32_t i = 0; i < found; ++i) {
+                got_ids[i] = results[i].id;
+            }
+            hits += overlap10(got_ids, found, &truth[qi * kK]);
+        }
+        const double sweep_s = seconds_since(t0);
+        std::printf("| %u | %.3f | %.0f us | %.0f |\n",
+                    ef,
+                    static_cast<double>(hits) /
+                        static_cast<double>(n_queries * kK),
+                    1.0e6 * sweep_s / static_cast<double>(n_queries),
+                    static_cast<double>(n_queries) / sweep_s);
+        std::fflush(stdout);
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+}
+
 } // namespace
 
-// Optional argv[1]: "clustered", "random", or "itq" runs just that scenario,
-// so each fits inside a CI/automation time budget; no argument runs all.
+// Optional argv[1]: "clustered", "random", "itq", or "million" runs just
+// that scenario, so each fits inside a CI/automation time budget; no
+// argument runs all.
 int main(int argc, char** argv) {
     const bool want_clustered =
         (argc < 2) || (std::strcmp(argv[1], "clustered") == 0);
@@ -560,6 +698,8 @@ int main(int argc, char** argv) {
         (argc < 2) || (std::strcmp(argv[1], "random") == 0);
     const bool want_itq =
         (argc < 2) || (std::strcmp(argv[1], "itq") == 0);
+    const bool want_million =
+        (argc < 2) || (std::strcmp(argv[1], "million") == 0);
 
     std::printf("# EdgeVector benchmark\n\n");
     std::printf("N = %zu vectors, dim = %zu (%zu quantized bytes each), "
@@ -577,6 +717,9 @@ int main(int argc, char** argv) {
     }
     if (want_itq) {
         run_itq_scenario();
+    }
+    if (want_million) {
+        run_million_scenario();
     }
 
     std::printf("Done.\n");
