@@ -14,7 +14,16 @@
 // contiguous, 8-byte-aligned block of quantized records (an MMapStorage
 // mapping or an in-memory buffer): record i lives at
 // `vectors + i * record_bytes`, laid out per quantize_math.hpp. Node ids are
-// indices into that block. Capacity is fixed at construction.
+// indices into that block.
+//
+// Capacity can GROW: grow(new_capacity, new_vectors) extends every internal
+// structure (existing links are untouched) and rebinds the vector base -
+// the caller enlarges or relocates its block first, then hands over the new
+// pointer (equal capacity = pure rebind after a realloc/remap). Growth is
+// serial-only and O(capacity). SearchContexts are sized for the capacity at
+// their creation: after grow(), searches through an outdated context safely
+// return 0 results - recreate contexts via make_context(). The internal
+// default context is recreated automatically.
 //
 // Per-node links are stored flat: one std::uint32_t array per node holding
 // M0 = 2*M slots for layer 0 followed by M slots for each upper layer the
@@ -350,10 +359,68 @@ public:
     std::uint32_t max_ef() const noexcept { return ef_limit_; }
 
     // Allocates a fresh scratch context sized for this graph. Do this once
-    // per querying thread, at setup time - never per query.
+    // per querying thread, at setup time - never per query. Contexts created
+    // before a grow() are undersized for the larger graph; searches through
+    // them return 0 results (safely) until they are recreated.
     SearchContext make_context() const {
         return SearchContext(capacity_, ef_limit_, m0_,
                              asymmetric_table_floats(dim_));
+    }
+
+    // Grows the slot count to `new_capacity` and rebinds the vector block to
+    // `new_vectors` (the caller enlarges or relocates its block FIRST; the
+    // first `capacity()` records must hold the same vectors as before).
+    // Every existing node, link, and tombstone is preserved untouched; ids
+    // [old capacity, new capacity) become insertable. new_capacity equal to
+    // the current capacity is a pure rebind. Returns false for a null
+    // pointer or a shrinking capacity. Serial-only: no queries, builds, or
+    // other mutations may run concurrently. O(capacity) time; may throw
+    // std::bad_alloc under memory exhaustion, like insert().
+    bool grow(std::uint32_t new_capacity, const std::uint8_t* new_vectors) {
+        if (new_vectors == nullptr || new_capacity < capacity_) {
+            return false;
+        }
+        vectors_ = new_vectors;
+        if (new_capacity == capacity_) {
+            return true;
+        }
+        const std::uint32_t old_capacity = capacity_;
+
+        std::uint8_t* new_levels = new std::uint8_t[new_capacity];
+        std::memcpy(new_levels, levels_.get(), old_capacity);
+        std::memset(new_levels + old_capacity, 0xFF,
+                    new_capacity - old_capacity);
+        levels_.reset(new_levels);
+
+        const std::size_t new_words =
+            (static_cast<std::size_t>(new_capacity) + 63u) / 64u;
+        std::uint64_t* new_deleted = new std::uint64_t[new_words];
+        std::memset(new_deleted, 0, new_words * 8u);
+        std::memcpy(new_deleted, deleted_.get(), deleted_words_ * 8u);
+        deleted_.reset(new_deleted);
+        deleted_words_ = new_words;
+
+        links_.resize(new_capacity);
+        counts_.resize(new_capacity);
+        capacity_ = new_capacity;
+
+#if defined(EDGEVECTOR_HAS_THREADS)
+        // Re-stripe the build locks for the larger id space (only ever
+        // grows; builds are not running during grow(), so no lock is held).
+        std::uint32_t stripes = 1u;
+        while (stripes < capacity_ && stripes < 8192u) {
+            stripes <<= 1u;
+        }
+        if (stripes != lock_mask_ + 1u) {
+            lock_mask_ = stripes - 1u;
+            locks_.reset(new std::mutex[stripes]);
+        }
+#endif
+
+        // The internal default context must match the new capacity; user
+        // contexts are invalidated (their searches return 0) until recreated.
+        default_ctx_.reset(new SearchContext(make_context()));
+        return true;
     }
 
     // BUILD PATH (allocation permitted). Inserts the vector at index `id` of
@@ -546,7 +613,8 @@ public:
                          std::uint32_t ef,
                          SearchResult* out,
                          const std::uint64_t* allow = nullptr) const noexcept {
-        if (!has_entry_ || k == 0u || q == nullptr || out == nullptr) {
+        if (!has_entry_ || k == 0u || q == nullptr || out == nullptr ||
+            ctx.capacity_ < capacity_) { // context predates a grow()
             return 0u;
         }
         clamp_kef(k, ef);
@@ -585,7 +653,8 @@ public:
                                   ScoredResult* out,
                                   const std::uint64_t* allow = nullptr) const noexcept {
         if (!has_entry_ || k == 0u || q_bits == nullptr ||
-            q_floats == nullptr || out == nullptr) {
+            q_floats == nullptr || out == nullptr ||
+            ctx.capacity_ < capacity_) { // context predates a grow()
             return 0u;
         }
         clamp_kef(k, ef);
@@ -648,7 +717,8 @@ public:
                                         const std::uint64_t* allow = nullptr) const noexcept {
         if (!has_entry_ || k == 0u || q_bits == nullptr ||
             q_floats == nullptr || vectors_f32 == nullptr ||
-            f32_stride < dim_ || out == nullptr) {
+            f32_stride < dim_ || out == nullptr ||
+            ctx.capacity_ < capacity_) { // context predates a grow()
             return 0u;
         }
         clamp_kef(k, ef);

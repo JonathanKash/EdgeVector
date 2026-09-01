@@ -929,6 +929,147 @@ void test_slot_reclamation(std::size_t dim) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Case 12: growable capacity — grow() must preserve every existing node and
+// link, rebind a RELOCATED vector block, accept parallel inserts into the
+// new region, invalidate pre-grow contexts safely, and compose with
+// persistence and slot reclamation.
+// ---------------------------------------------------------------------------
+void test_growable_capacity(std::size_t dim) {
+    std::printf("[12] Growable capacity\n");
+
+    const std::size_t n_old = 300;
+    const std::size_t n_new = 600;
+    std::mt19937 rng(53);
+    RecordBlock small_block(dim, n_old);
+    fill_random_block(small_block, dim, rng);
+
+    edgevector::HNSWGraph graph(small_block.base(), small_block.record_bytes(),
+                                dim, static_cast<std::uint32_t>(n_old));
+    for (std::uint32_t i = 0; i < n_old; ++i) {
+        graph.insert(i);
+    }
+
+    // A context created BEFORE the grow, to verify safe invalidation later.
+    edgevector::SearchContext stale_ctx = graph.make_context();
+    edgevector::SearchResult res[10];
+    std::uint32_t found =
+        graph.search(stale_ctx, small_block.record(5), 10u, 100u, res, nullptr);
+    check(found == 10u && res[0].id == 5u,
+          "pre-grow context works before the grow");
+
+    // Contract checks.
+    check(!graph.grow(100u, small_block.base()),
+          "shrinking grow is rejected");
+    check(!graph.grow(static_cast<std::uint32_t>(n_new), nullptr),
+          "null vector base is rejected");
+
+    // Relocated, larger block: old records copied over, new region filled
+    // with fresh vectors.
+    RecordBlock big_block(dim, n_new);
+    std::memcpy(big_block.record(0), small_block.record(0),
+                n_old * small_block.record_bytes());
+    {
+        std::normal_distribution<float> dist(0.0f, 1.0f);
+        std::vector<float> raw(dim);
+        for (std::size_t i = n_old; i < n_new; ++i) {
+            for (std::size_t d = 0; d < dim; ++d) {
+                raw[d] = dist(rng);
+            }
+            edgevector::quantize(raw.data(), dim, big_block.record(i));
+        }
+    }
+
+    check(graph.grow(static_cast<std::uint32_t>(n_new), big_block.base()),
+          "grow to 2x capacity with a relocated block succeeds");
+    check(graph.capacity() == n_new, "capacity() reflects the growth");
+    check(graph.size() == n_old, "size() unchanged by grow");
+    check(graph.validate_integrity(), "integrity holds right after grow");
+
+    // Old nodes still served (through the recreated default context).
+    bool old_intact = true;
+    for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(n_old); i += 30u) {
+        found = graph.search(big_block.record(i), 10u, 100u, res);
+        if (!(found == 10u && res[0].id == i && res[0].distance == 0u)) {
+            old_intact = false;
+        }
+    }
+    check(old_intact, "every sampled pre-grow vector still finds itself");
+
+    // Parallel insert into the grown region (also exercises re-striped locks).
+    std::vector<std::uint32_t> new_ids;
+    for (std::uint32_t i = static_cast<std::uint32_t>(n_old);
+         i < static_cast<std::uint32_t>(n_new); ++i) {
+        new_ids.push_back(i);
+    }
+    check(graph.insert_batch(new_ids.data(), new_ids.size(), 4u) ==
+              new_ids.size(),
+          "parallel insert_batch fills the grown region");
+    check(graph.size() == n_new && graph.validate_integrity(),
+          "full graph valid after growing and filling");
+
+    // Stale context: safe zero-result refusal; fresh context agrees with the
+    // default context.
+    found = graph.search(stale_ctx, big_block.record(400), 10u, 100u, res,
+                         nullptr);
+    check(found == 0u, "pre-grow context safely returns 0 after grow");
+    edgevector::SearchContext fresh_ctx = graph.make_context();
+    edgevector::SearchResult res2[10];
+    const std::uint32_t fa =
+        graph.search(fresh_ctx, big_block.record(400), 10u, 100u, res, nullptr);
+    const std::uint32_t fb = graph.search(big_block.record(400), 10u, 100u, res2);
+    bool agree = (fa == fb) && fa == 10u;
+    for (std::uint32_t i = 0; agree && i < fa; ++i) {
+        agree = (res[i].id == res2[i].id) &&
+                (res[i].distance == res2[i].distance);
+    }
+    check(agree, "a fresh context matches the default context after grow");
+
+    std::mt19937 qrng(59);
+    const double recall =
+        measure_recall(graph, big_block, dim, 15u, 10u, 100u, qrng);
+    std::printf("      post-grow recall@10 = %.4f  (gate >= 0.90)\n", recall);
+    check(recall >= 0.90, "post-grow recall@10 >= 0.90 over all 600 vectors");
+
+    // Persistence composes: a save after grow round-trips at the NEW
+    // capacity and refuses the old one.
+    const char* const kGrowFile = "ev_test_grow.evhg";
+    check(graph.save_graph(kGrowFile) == edgevector::GraphIoStatus::ok,
+          "post-grow graph saved");
+    edgevector::HNSWGraph reloaded(big_block.base(), big_block.record_bytes(),
+                                   dim, static_cast<std::uint32_t>(n_new));
+    check(reloaded.load_graph(kGrowFile) == edgevector::GraphIoStatus::ok,
+          "post-grow file loads at the new capacity");
+    found = reloaded.search(big_block.record(400), 10u, 100u, res);
+    check(found == 10u && res[0].id == 400u && res[0].distance == 0u,
+          "reloaded grown graph serves the grown region");
+    edgevector::HNSWGraph small_again(small_block.base(),
+                                      small_block.record_bytes(), dim,
+                                      static_cast<std::uint32_t>(n_old));
+    check(small_again.load_graph(kGrowFile) ==
+              edgevector::GraphIoStatus::incompatible,
+          "post-grow file is rejected at the old capacity");
+    std::remove(kGrowFile);
+
+    // Pure rebind (equal capacity) and reclamation in the grown region.
+    check(graph.grow(static_cast<std::uint32_t>(n_new), big_block.base()),
+          "equal-capacity grow acts as a pure rebind");
+    check(graph.remove(450u), "remove in the grown region");
+    {
+        std::normal_distribution<float> dist(0.0f, 1.0f);
+        std::vector<float> raw(dim);
+        for (std::size_t d = 0; d < dim; ++d) {
+            raw[d] = dist(rng);
+        }
+        edgevector::quantize(raw.data(), dim, big_block.record(450));
+    }
+    check(graph.reinsert(450u), "reinsert in the grown region");
+    found = graph.search(big_block.record(450), 10u, 100u, res);
+    check(found == 10u && res[0].id == 450u && res[0].distance == 0u &&
+              graph.validate_integrity(),
+          "reclaimed grown-region slot serves its new vector, integrity holds");
+}
+
 } // namespace
 
 int main() {
@@ -962,6 +1103,7 @@ int main() {
     test_reranked_accuracy(graph, floats, n, dim);
     test_parallel_build(graph, data, dim, n);
     test_slot_reclamation(dim);
+    test_growable_capacity(dim);
 
     std::printf("\n=== %s ===\n",
                 (g_failures == 0) ? "ALL CASES PASSED" : "FAILURES DETECTED");

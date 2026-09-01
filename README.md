@@ -16,11 +16,12 @@ zero dependencies — with a two-stage retrieval pipeline that reaches
   `SearchContext` scratch pools for queries, and a striped-lock parallel
   build: 100k vectors in **7.9 s on 12 threads vs 64.3 s serial (8.1x)**,
   validated by a full referential-integrity sweep after every parallel build
-- **Soft deletion, filtered search, and slot reclamation** — tombstones plus
-  caller-supplied allow-bitmaps, composable, persisted in the graph file; a
-  tombstoned slot can be reclaimed for a brand-new vector in ~2.9 ms at 100k
-  (`remove` → overwrite bytes → `reinsert`), leaving zero dangling edges by
-  construction
+- **A fully dynamic index** — soft deletion and filtered search (tombstones
+  plus caller-supplied allow-bitmaps, composable, persisted in the graph
+  file); slot reclamation for brand-new vectors in ~2.9 ms at 100k
+  (`remove` → overwrite bytes → `reinsert`, zero dangling edges by
+  construction); and growable capacity (`grow()` extends the id space and
+  rebinds a relocated vector block, preserving every existing link)
 - **~0.05 s startup at 100k vectors** — mmap the codes, load the prebuilt
   graph (~1,400x faster than rebuilding)
 - **Learned ITQ rotation** for anisotropic (real-embedding-shaped) data:
@@ -197,6 +198,14 @@ quantize(new_floats, dim, base + 42 * rb); // caller overwrites the bytes...
 graph.reinsert(42);                        // ...then the graph relinks: ~3 ms
                                            //   at 100k, no dangling edges
 
+// Growable capacity: enlarge (or relocate) YOUR vector block first, then
+// hand the graph the new base. Existing links are untouched; the new ids
+// become insertable (insert_batch works). Contexts created before a grow
+// safely return 0 results - recreate them with make_context().
+buf.resize((rb / 8) * 2 * n);              // caller grows the block...
+base = reinterpret_cast<std::uint8_t*>(buf.data());
+graph.grow(2 * n, base);                   // ...graph extends and rebinds
+
 std::vector<std::uint64_t> allow((n + 63) / 64, 0);
 // ... set one bit per permitted id ...
 graph.search(ctx, q, 10, 50, by_hamming, allow.data());
@@ -262,7 +271,9 @@ against float32 ground truth, graph persistence round-trips (bitwise-identical
 results and surviving tombstones after reload), context isolation plus a
 4-thread concurrency test, delete/restore/filter composition, slot
 reclamation (new-vector serving, no-dangling-edge integrity after churn of
-100 slots, full entry-point turnover, single-node bootstrap), ITQ invariants
+100 slots, full entry-point turnover, single-node bootstrap), growable
+capacity (2x growth with a relocated block, parallel fill of the new region,
+stale-context invalidation, persistence at the new capacity), ITQ invariants
 (orthogonality, exact cosine preservation, monotone objective, determinism,
 hostile-file rejection, end-to-end recall gain), concurrent construction
 (single-thread batch bit-identical to serial insert; 4-thread build passing
@@ -278,12 +289,14 @@ including bit-identical ITQ training results vs x86-64 — is validated.
 
 ## Status and roadmap
 
-v0.6. Known limitations, in priority order:
+v0.7. Known limitations, in priority order:
 
-1. **Capacity is fixed at construction** — slots can now be reclaimed for
-   new vectors (`remove` → overwrite → `reinsert`, ~2.9 ms each at 100k,
-   serial-only, O(total links) per reclaim by design: exhaustive unlinking
-   over heuristic repair), but the total slot count cannot grow
+1. **Dynamic operations are serial** — `reinsert` (~2.9 ms each at 100k;
+   O(total links) by design, exhaustive unlinking over heuristic repair) and
+   `grow` must not run concurrently with queries or builds, and a `grow`
+   invalidates outstanding `SearchContext`s (their searches safely return 0
+   until recreated). Growing the vector block itself is the caller's job —
+   an mmap'ed block means writing and remapping a larger file
 2. **Highly selective filters degrade** toward a scan of the reachable graph
    (true of every filtered-HNSW implementation; documented, not hidden)
 3. **ARM validated for correctness, not yet for performance** — all suites
