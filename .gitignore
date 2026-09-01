@@ -5,6 +5,9 @@ tests/test_mmap_storage
 tests/test_hnsw_graph
 tests/test_integration
 tests/*_release
+tests/benchmark_100k
 
-# Transient index files a crashed test run might leave behind
+# Transient index/graph files a crashed test or benchmark run might leave behind
 tests/ev_test_*.evec
+tests/ev_test_*.evhg
+tests/ev_bench_*.evhg

@@ -292,6 +292,110 @@ void test_zero_allocation(edgevector::HNSWGraph& graph, const RecordBlock& data,
     (void)data;
 }
 
+// ---------------------------------------------------------------------------
+// Case 6: graph persistence — a loaded graph must be indistinguishable from
+// the one that was saved, and a damaged or mismatched file must be rejected
+// leaving the target graph empty.
+// ---------------------------------------------------------------------------
+void test_persistence(edgevector::HNSWGraph& graph, const RecordBlock& data,
+                      std::size_t dim) {
+    std::printf("[6] Graph persistence (save/load round trip)\n");
+
+    const char* const kGraphFile = "ev_test_graph.evhg";
+    const char* const kBadFile = "ev_test_graph_bad.evhg";
+
+    check(graph.save_graph(kGraphFile) == edgevector::GraphIoStatus::ok,
+          "save_graph returns ok");
+
+    edgevector::HNSWGraph loaded(data.base(), data.record_bytes(), dim,
+                                 graph.capacity(), /*m=*/16u,
+                                 /*ef_construction=*/200u,
+                                 /*max_ef_search=*/256u, /*seed=*/42u);
+    check(loaded.load_graph(kGraphFile) == edgevector::GraphIoStatus::ok,
+          "load_graph returns ok");
+    check(loaded.size() == graph.size(), "loaded size matches");
+
+    // Identical results — ids AND distances — for 20 fresh queries.
+    std::mt19937 rng(17);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> raw(dim);
+    std::vector<std::uint64_t> qwords(edgevector::padded_bytes(dim) / 8u, 0u);
+    std::uint8_t* qbytes = reinterpret_cast<std::uint8_t*>(qwords.data());
+    edgevector::SearchResult a[10];
+    edgevector::SearchResult b[10];
+
+    bool identical = true;
+    for (int t = 0; t < 20; ++t) {
+        for (std::size_t d = 0; d < dim; ++d) {
+            raw[d] = dist(rng);
+        }
+        edgevector::quantize(raw.data(), dim, qbytes);
+        const std::uint32_t fa = graph.search(qbytes, 10u, 100u, a);
+        const std::uint32_t fb = loaded.search(qbytes, 10u, 100u, b);
+        if (fa != fb) {
+            identical = false;
+            continue;
+        }
+        for (std::uint32_t i = 0; i < fa; ++i) {
+            if (a[i].id != b[i].id || a[i].distance != b[i].distance) {
+                identical = false;
+            }
+        }
+    }
+    check(identical, "20 queries: loaded graph returns identical (id, dist)");
+
+    // Rejection: flipped magic byte.
+    {
+        std::FILE* in = std::fopen(kGraphFile, "rb");
+        std::fseek(in, 0, SEEK_END);
+        const long len = std::ftell(in);
+        std::fseek(in, 0, SEEK_SET);
+        std::vector<std::uint8_t> bytes(static_cast<std::size_t>(len));
+        const bool read_ok =
+            std::fread(bytes.data(), 1u, bytes.size(), in) == bytes.size();
+        std::fclose(in);
+        check(read_ok, "reference graph file read back");
+
+        bytes[0] = static_cast<std::uint8_t>('X');
+        std::FILE* out = std::fopen(kBadFile, "wb");
+        std::fwrite(bytes.data(), 1u, bytes.size(), out);
+        std::fclose(out);
+        check(loaded.load_graph(kBadFile) == edgevector::GraphIoStatus::bad_magic,
+              "flipped magic -> bad_magic");
+        check(loaded.size() == 0u, "failed load leaves the graph empty");
+
+        // Rejection: truncated body (magic restored first, so the failure is
+        // attributable to the truncation alone).
+        bytes[0] = static_cast<std::uint8_t>('E');
+        out = std::fopen(kBadFile, "wb");
+        std::fwrite(bytes.data(), 1u, bytes.size() - 5u, out);
+        std::fclose(out);
+        const edgevector::GraphIoStatus st = loaded.load_graph(kBadFile);
+        check(st == edgevector::GraphIoStatus::io_error ||
+                  st == edgevector::GraphIoStatus::corrupt,
+              "truncated file rejected");
+    }
+
+    // Rejection: parameter mismatch (different M).
+    {
+        edgevector::HNSWGraph wrong_m(data.base(), data.record_bytes(), dim,
+                                      graph.capacity(), /*m=*/8u);
+        check(wrong_m.load_graph(kGraphFile) ==
+                  edgevector::GraphIoStatus::incompatible,
+              "M mismatch -> incompatible");
+    }
+
+    // A successfully re-loaded graph keeps working and accepts new inserts
+    // when spare capacity exists (none here: capacity is full, so the insert
+    // must be cleanly refused, not corrupt anything).
+    check(loaded.load_graph(kGraphFile) == edgevector::GraphIoStatus::ok,
+          "re-load after failed loads returns ok");
+    check(!loaded.insert(0u), "insert of an existing id is still rejected");
+
+    std::remove(kGraphFile);
+    std::remove(kBadFile);
+}
+
 } // namespace
 
 int main() {
@@ -318,6 +422,7 @@ int main() {
     test_scale_recall(graph, data, dim);
     test_sorted_output(graph, data, dim);
     test_zero_allocation(graph, data, dim);
+    test_persistence(graph, data, dim);
 
     std::printf("\n=== %s ===\n",
                 (g_failures == 0) ? "ALL CASES PASSED" : "FAILURES DETECTED");

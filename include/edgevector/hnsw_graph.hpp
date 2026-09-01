@@ -47,6 +47,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <random>
@@ -59,6 +60,18 @@ namespace edgevector {
 struct SearchResult {
     std::uint32_t id;
     std::uint32_t distance;
+};
+
+// Status of save_graph()/load_graph(). Like the storage module, graph I/O
+// never throws; every failure is a status value and a failed load leaves the
+// graph empty rather than half-populated.
+enum class GraphIoStatus : std::uint8_t {
+    ok = 0,
+    io_error,     // open/read/write failed
+    bad_magic,
+    bad_version,
+    incompatible, // file's dim/capacity/M differ from this graph's config
+    corrupt       // internal inconsistency (bad level, count, link, or size)
 };
 
 namespace detail {
@@ -301,6 +314,101 @@ public:
         return found;
     }
 
+    // ------------------------------------------------------------------------
+    // GRAPH PERSISTENCE (version 1, little-endian, load-time path)
+    //
+    // The link structure is saved separately from the vectors: the vector file
+    // is owned by mmap_storage.hpp, this file holds only the graph. A saved
+    // graph is only meaningful next to the exact vector block it was built
+    // over; pair the two files and load them together.
+    //
+    //   Bytes  0.. 3  char magic[4] = { 'E','V','H','G' }
+    //   Bytes  4.. 7  u32  version  = 1
+    //   Bytes  8..15  u64  dim
+    //   Bytes 16..19  u32  capacity
+    //   Bytes 20..23  u32  M
+    //   Bytes 24..27  u32  size (inserted node count)
+    //   Bytes 28..31  u32  entry point id
+    //   Bytes 32..35  u32  entry point level
+    //   Byte  36      u8   has_entry (0 or 1)
+    //   Bytes 37..63  zeroed reserved padding
+    //   Then per node id in [0, capacity):
+    //     u8 level (0xFF = not inserted; nothing else follows for that id)
+    //     u32 counts[level + 1]
+    //     u32 slots[M0 + level * M]
+    //
+    // load_graph() validates everything it reads (levels, counts, link
+    // targets, entry point, node count, exact file length) and rejects a file
+    // whose dim/capacity/M differ from this graph's construction parameters.
+    // ------------------------------------------------------------------------
+
+    GraphIoStatus save_graph(const char* path) const {
+        if (path == nullptr) {
+            return GraphIoStatus::io_error;
+        }
+        std::FILE* f = std::fopen(path, "wb");
+        if (f == nullptr) {
+            return GraphIoStatus::io_error;
+        }
+
+        std::uint8_t header[kIoHeaderBytes];
+        std::memset(header, 0, sizeof(header));
+        header[0] = static_cast<std::uint8_t>('E');
+        header[1] = static_cast<std::uint8_t>('V');
+        header[2] = static_cast<std::uint8_t>('H');
+        header[3] = static_cast<std::uint8_t>('G');
+        const std::uint32_t version = kIoVersion;
+        const std::uint64_t dim64 = static_cast<std::uint64_t>(dim_);
+        const std::uint8_t has_entry = has_entry_ ? 1u : 0u;
+        std::memcpy(header + 4u, &version, 4u);
+        std::memcpy(header + 8u, &dim64, 8u);
+        std::memcpy(header + 16u, &capacity_, 4u);
+        std::memcpy(header + 20u, &m_, 4u);
+        std::memcpy(header + 24u, &size_, 4u);
+        std::memcpy(header + 28u, &entry_, 4u);
+        std::memcpy(header + 32u, &entry_level_, 4u);
+        std::memcpy(header + 36u, &has_entry, 1u);
+
+        bool ok = std::fwrite(header, 1u, sizeof(header), f) == sizeof(header);
+        for (std::uint32_t id = 0u; ok && id < capacity_; ++id) {
+            const std::uint8_t lvl = levels_[id];
+            ok = std::fwrite(&lvl, 1u, 1u, f) == 1u;
+            if (!ok || lvl == kNotInserted) {
+                continue;
+            }
+            const std::size_t n_counts = counts_[id].size();
+            const std::size_t n_slots = links_[id].size();
+            ok = std::fwrite(counts_[id].data(), 4u, n_counts, f) == n_counts &&
+                 std::fwrite(links_[id].data(), 4u, n_slots, f) == n_slots;
+        }
+
+        if (std::fclose(f) != 0) {
+            ok = false;
+        }
+        return ok ? GraphIoStatus::ok : GraphIoStatus::io_error;
+    }
+
+    // Replaces the graph's state with the file's contents. On any failure the
+    // graph is left EMPTY (not half-loaded) and the status says why. The file
+    // must have been saved by a graph with identical dim, capacity, and M,
+    // over the same vector block this graph was constructed with.
+    GraphIoStatus load_graph(const char* path) {
+        reset_graph_state();
+        if (path == nullptr) {
+            return GraphIoStatus::io_error;
+        }
+        std::FILE* f = std::fopen(path, "rb");
+        if (f == nullptr) {
+            return GraphIoStatus::io_error;
+        }
+        const GraphIoStatus st = load_graph_body(f);
+        std::fclose(f);
+        if (st != GraphIoStatus::ok) {
+            reset_graph_state();
+        }
+        return st;
+    }
+
     // Bytes of pre-allocated + per-node graph memory (links, counts, levels,
     // visited set, heaps). For footprint reporting; not on any hot path.
     std::size_t graph_memory_bytes() const noexcept {
@@ -319,6 +427,136 @@ public:
 private:
     static constexpr std::uint8_t kNotInserted = 0xFFu;
     static constexpr std::uint32_t kMaxLevel = 31u;
+    static constexpr std::size_t kIoHeaderBytes = 64u;
+    static constexpr std::uint32_t kIoVersion = 1u;
+
+    void reset_graph_state() {
+        std::memset(levels_.get(), 0xFF, capacity_);
+        for (std::uint32_t i = 0u; i < capacity_; ++i) {
+            links_[i].clear();
+            links_[i].shrink_to_fit();
+            counts_[i].clear();
+            counts_[i].shrink_to_fit();
+        }
+        has_entry_ = false;
+        entry_ = 0u;
+        entry_level_ = 0u;
+        size_ = 0u;
+    }
+
+    static bool read_exact(std::FILE* f, void* dst, std::size_t n) {
+        return std::fread(dst, 1u, n, f) == n;
+    }
+
+    GraphIoStatus load_graph_body(std::FILE* f) {
+        std::uint8_t header[kIoHeaderBytes];
+        if (!read_exact(f, header, sizeof(header))) {
+            return GraphIoStatus::io_error;
+        }
+        if (header[0] != static_cast<std::uint8_t>('E') ||
+            header[1] != static_cast<std::uint8_t>('V') ||
+            header[2] != static_cast<std::uint8_t>('H') ||
+            header[3] != static_cast<std::uint8_t>('G')) {
+            return GraphIoStatus::bad_magic;
+        }
+        std::uint32_t version = 0u;
+        std::memcpy(&version, header + 4u, 4u);
+        if (version != kIoVersion) {
+            return GraphIoStatus::bad_version;
+        }
+        std::uint64_t dim64 = 0u;
+        std::uint32_t capacity = 0u;
+        std::uint32_t m = 0u;
+        std::uint32_t size = 0u;
+        std::uint32_t entry = 0u;
+        std::uint32_t entry_level = 0u;
+        std::uint8_t has_entry = 0u;
+        std::memcpy(&dim64, header + 8u, 8u);
+        std::memcpy(&capacity, header + 16u, 4u);
+        std::memcpy(&m, header + 20u, 4u);
+        std::memcpy(&size, header + 24u, 4u);
+        std::memcpy(&entry, header + 28u, 4u);
+        std::memcpy(&entry_level, header + 32u, 4u);
+        std::memcpy(&has_entry, header + 36u, 1u);
+
+        if (dim64 != static_cast<std::uint64_t>(dim_) ||
+            capacity != capacity_ || m != m_) {
+            return GraphIoStatus::incompatible;
+        }
+        if (size > capacity_ || has_entry > 1u ||
+            (has_entry == 0u && size > 0u) || entry_level > kMaxLevel ||
+            (has_entry == 1u && entry >= capacity_)) {
+            return GraphIoStatus::corrupt;
+        }
+
+        std::uint32_t loaded = 0u;
+        for (std::uint32_t id = 0u; id < capacity_; ++id) {
+            std::uint8_t lvl = 0u;
+            if (!read_exact(f, &lvl, 1u)) {
+                return GraphIoStatus::io_error;
+            }
+            if (lvl == kNotInserted) {
+                continue;
+            }
+            if (static_cast<std::uint32_t>(lvl) > kMaxLevel) {
+                return GraphIoStatus::corrupt;
+            }
+            counts_[id].assign(static_cast<std::size_t>(lvl) + 1u, 0u);
+            links_[id].assign(static_cast<std::size_t>(m0_) +
+                                  static_cast<std::size_t>(lvl) * m_,
+                              0u);
+            if (!read_exact(f, counts_[id].data(), counts_[id].size() * 4u) ||
+                !read_exact(f, links_[id].data(), links_[id].size() * 4u)) {
+                return GraphIoStatus::io_error;
+            }
+            for (std::uint32_t l = 0u; l <= static_cast<std::uint32_t>(lvl); ++l) {
+                if (counts_[id][l] > max_m(l)) {
+                    return GraphIoStatus::corrupt;
+                }
+            }
+            levels_[id] = lvl;
+            ++loaded;
+        }
+
+        std::uint8_t trailing = 0u;
+        if (loaded != size || std::fread(&trailing, 1u, 1u, f) != 0u) {
+            return GraphIoStatus::corrupt; // node count or file length is off
+        }
+
+        // Referential integrity: every link must point at an inserted node
+        // that actually exists on that layer, and never at itself.
+        for (std::uint32_t id = 0u; id < capacity_; ++id) {
+            if (levels_[id] == kNotInserted) {
+                continue;
+            }
+            const std::uint32_t lvl = static_cast<std::uint32_t>(levels_[id]);
+            for (std::uint32_t l = 0u; l <= lvl; ++l) {
+                const std::size_t offset =
+                    (l == 0u) ? 0u
+                              : static_cast<std::size_t>(m0_) +
+                                    static_cast<std::size_t>(l - 1u) * m_;
+                for (std::uint32_t i = 0u; i < counts_[id][l]; ++i) {
+                    const std::uint32_t t = links_[id][offset + i];
+                    if (t >= capacity_ || t == id ||
+                        levels_[t] == kNotInserted ||
+                        static_cast<std::uint32_t>(levels_[t]) < l) {
+                        return GraphIoStatus::corrupt;
+                    }
+                }
+            }
+        }
+        if (has_entry == 1u &&
+            (levels_[entry] == kNotInserted ||
+             static_cast<std::uint32_t>(levels_[entry]) < entry_level)) {
+            return GraphIoStatus::corrupt;
+        }
+
+        has_entry_ = (has_entry == 1u);
+        entry_ = entry;
+        entry_level_ = entry_level;
+        size_ = size;
+        return GraphIoStatus::ok;
+    }
 
     const std::uint8_t* vec(std::uint32_t id) const noexcept {
         return vectors_ + static_cast<std::size_t>(id) * record_bytes_;
@@ -447,6 +685,16 @@ private:
     // ascending distance to the base point, keep one only if it is closer to
     // the base than to every neighbor already kept. Reads select_buf_[0..n),
     // which must be sorted ascending; writes ids into selected_.
+    //
+    // Includes the paper's keepPrunedConnections extension: unfilled slots
+    // are backfilled with the pruned candidates, closest first, so node
+    // degree never collapses on distributions where the heuristic prunes
+    // aggressively. (Measured note: on both iid-random and clustered 512-bit
+    // data this backfill did not change recall — the heuristic was already
+    // filling the slots — but it is kept as cheap insurance for adversarial
+    // distributions. Low recall on iid random data is NOT a graph defect: it
+    // is the intrinsic-dimensionality wall every ANN index hits on
+    // structureless data; see the benchmark's two scenarios.)
     std::uint32_t select_neighbors(std::uint32_t n_candidates, std::uint32_t mm) {
         std::uint32_t n_sel = 0u;
         for (std::uint32_t i = 0u; i < n_candidates && n_sel < mm; ++i) {
@@ -462,6 +710,23 @@ private:
             }
             if (keep) {
                 selected_[n_sel] = c.id;
+                ++n_sel;
+            }
+        }
+
+        // keepPrunedConnections: top up with the pruned candidates in
+        // ascending distance until the slots are full or candidates run out.
+        for (std::uint32_t i = 0u; i < n_candidates && n_sel < mm; ++i) {
+            const std::uint32_t cand_id = select_buf_[i].id;
+            bool already = false;
+            for (std::uint32_t s = 0u; s < n_sel; ++s) {
+                if (selected_[s] == cand_id) {
+                    already = true;
+                    break;
+                }
+            }
+            if (!already) {
+                selected_[n_sel] = cand_id;
                 ++n_sel;
             }
         }

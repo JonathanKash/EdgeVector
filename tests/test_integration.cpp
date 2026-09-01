@@ -194,8 +194,53 @@ int main() {
                 delta);
     check(delta == 0u, "zero heap allocations across 50 mapped searches");
 
-    // -- Stage 5: memory footprint target ------------------------------------
-    std::printf("[5] Memory footprint (CLAUDE.md >= 30x target)\n");
+    // -- Stage 5: persist the graph, reload it, search without rebuilding ----
+    // The full edge-device startup story: map the vector file, load the graph
+    // file, serve queries — no construction cost at boot.
+    std::printf("[5] Graph persistence over the mapping\n");
+
+    const char* const kGraphFile = "ev_test_integration.evhg";
+    check(graph.save_graph(kGraphFile) == edgevector::GraphIoStatus::ok,
+          "graph saved");
+
+    edgevector::HNSWGraph reloaded(storage.vector(0), storage.record_bytes(),
+                                   dim, static_cast<std::uint32_t>(n),
+                                   /*m=*/16u, /*ef_construction=*/200u,
+                                   /*max_ef_search=*/256u, /*seed=*/42u);
+    check(reloaded.load_graph(kGraphFile) == edgevector::GraphIoStatus::ok,
+          "graph loaded into a fresh instance");
+
+    std::vector<edgevector::SearchResult> results2(k);
+    bool identical = true;
+    for (int t = 0; t < 20; ++t) {
+        for (std::size_t d = 0; d < dim; ++d) {
+            raw[d] = dist(qrng);
+        }
+        edgevector::quantize(raw.data(), dim, qbytes);
+        const std::uint32_t fa = graph.search(qbytes, k, ef, results.data());
+        const std::uint32_t fb = reloaded.search(qbytes, k, ef, results2.data());
+        if (fa != fb) {
+            identical = false;
+            continue;
+        }
+        for (std::uint32_t i = 0; i < fa; ++i) {
+            if (results[i].id != results2[i].id ||
+                results[i].distance != results2[i].distance) {
+                identical = false;
+            }
+        }
+    }
+    check(identical, "reloaded graph returns identical (id, dist) for 20 queries");
+
+    const std::size_t before2 = g_new_calls;
+    for (int t = 0; t < 20; ++t) {
+        reloaded.search(qbytes, k, ef, results2.data());
+    }
+    check(g_new_calls - before2 == 0u,
+          "zero heap allocations searching the reloaded graph");
+
+    // -- Stage 6: memory footprint target ------------------------------------
+    std::printf("[6] Memory footprint (CLAUDE.md >= 30x target)\n");
 
     const std::size_t quant_payload = n * edgevector::padded_bytes(dim);
     const std::size_t float_payload = n * dim * sizeof(float);
@@ -215,6 +260,7 @@ int main() {
     check(payload_ratio >= 30.0, "quantized payload >= 30x smaller than float32");
 
     // -- Cleanup --------------------------------------------------------------
+    std::remove(kGraphFile);
     storage.close(); // must precede deletion: Windows cannot delete mapped files
     std::remove(kIndexFile);
 

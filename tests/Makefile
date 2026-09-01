@@ -89,6 +89,18 @@ run-release: $(RELEASE_TARGETS)
 	./test_hnsw_graph_release$(EXE)
 	./test_integration_release$(EXE)
 
+# --- benchmark (always -DNDEBUG: assert-enabled numbers are meaningless) ----
+
+BENCH_TARGET := benchmark_100k$(EXE)
+
+$(BENCH_TARGET): benchmark_100k.cpp $(HNSW_HEADERS)
+	$(CXX) $(RELEASE_FLAGS) $(INCLUDES) benchmark_100k.cpp -o $@
+
+bench: $(BENCH_TARGET)
+	./$(BENCH_TARGET)
+
+.PHONY: bench
+
 clean:
 	rm -f $(TARGET) $(STORAGE_TARGET) $(HNSW_TARGET) $(INTEG_TARGET) \
-	      $(RELEASE_TARGETS)
+	      $(RELEASE_TARGETS) $(BENCH_TARGET)
