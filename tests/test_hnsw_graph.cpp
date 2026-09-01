@@ -785,6 +785,150 @@ void test_parallel_build(edgevector::HNSWGraph& serial_graph,
     check(recall >= 0.90, "parallel-built graph meets the recall gate");
 }
 
+// ---------------------------------------------------------------------------
+// Case 11: slot reclamation — remove -> overwrite bytes -> reinsert must make
+// the slot serve its NEW vector, leave no dangling edge (full integrity
+// sweep), survive heavy churn including entry-point turnover, and hold the
+// recall gate afterwards.
+// ---------------------------------------------------------------------------
+void test_slot_reclamation(std::size_t dim) {
+    std::printf("[11] Slot reclamation (remove -> overwrite -> reinsert)\n");
+
+    const std::size_t n = 500;
+    std::mt19937 rng(43);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    RecordBlock data(dim, n);
+    fill_random_block(data, dim, rng);
+
+    edgevector::HNSWGraph graph(data.base(), data.record_bytes(), dim,
+                                static_cast<std::uint32_t>(n));
+    for (std::uint32_t i = 0; i < n; ++i) {
+        graph.insert(i);
+    }
+
+    // Contract checks.
+    check(!graph.reinsert(123u), "reinsert of a live (non-deleted) id is rejected");
+    check(!graph.reinsert(static_cast<std::uint32_t>(n)),
+          "reinsert of an out-of-range id is rejected");
+
+    // Reclaim one slot with a brand-new vector.
+    const std::uint32_t victim = 123u;
+    std::vector<float> old_raw(dim);
+    std::vector<std::uint64_t> oldq(edgevector::padded_bytes(dim) / 8u, 0u);
+    std::memcpy(oldq.data(), data.record(victim),
+                edgevector::padded_bytes(dim));
+
+    check(graph.remove(victim), "victim removed");
+    std::vector<float> raw(dim);
+    for (std::size_t d = 0; d < dim; ++d) {
+        raw[d] = dist(rng);
+    }
+    edgevector::quantize(raw.data(), dim, data.record(victim)); // new bytes
+    check(graph.reinsert(victim), "reinsert succeeds on a tombstoned slot");
+    check(!graph.is_deleted(victim) && graph.deleted_count() == 0u,
+          "tombstone cleared by reinsert");
+    check(graph.size() == n && graph.live_size() == n,
+          "size and live_size unchanged after reclamation");
+    check(graph.validate_integrity(),
+          "graph passes full integrity validation after reclamation");
+
+    edgevector::SearchResult res[10];
+    std::uint32_t found = graph.search(data.record(victim), 10u, 100u, res);
+    check(found == 10u && res[0].id == victim && res[0].distance == 0u,
+          "reclaimed slot serves its NEW vector (self-query, distance 0)");
+    found = graph.search(reinterpret_cast<const std::uint8_t*>(oldq.data()),
+                         10u, 100u, res);
+    check(!(found > 0u && res[0].id == victim && res[0].distance == 0u),
+          "the OLD vector no longer maps to the reclaimed id at distance 0");
+
+    // Churn: reclaim 100 random slots with new vectors, then re-validate and
+    // hold the recall gate against brute force over the CURRENT data.
+    std::uniform_int_distribution<std::uint32_t> pick(
+        0u, static_cast<std::uint32_t>(n - 1u));
+    std::uint32_t churned = 0u;
+    for (int t = 0; t < 100; ++t) {
+        const std::uint32_t id = pick(rng);
+        if (!graph.remove(id)) {
+            continue; // already reclaimed this round; fine
+        }
+        for (std::size_t d = 0; d < dim; ++d) {
+            raw[d] = dist(rng);
+        }
+        edgevector::quantize(raw.data(), dim, data.record(id));
+        if (graph.reinsert(id)) {
+            ++churned;
+        }
+    }
+    char msg[128];
+    std::snprintf(msg, sizeof(msg),
+                  "churn of %u slots kept full integrity", churned);
+    check(churned > 0u && graph.validate_integrity(), msg);
+
+    std::mt19937 qrng(47);
+    const double recall = measure_recall(graph, data, dim, 15u, 10u, 100u, qrng);
+    std::printf("      post-churn recall@10 = %.4f  (gate >= 0.90)\n", recall);
+    check(recall >= 0.90, "post-churn recall@10 >= 0.90");
+
+    // Entry-point turnover: reclaim EVERY slot in a small graph, so whichever
+    // node holds the entry point is guaranteed to be reclaimed at some point.
+    {
+        const std::size_t m = 60;
+        RecordBlock mini(dim, m);
+        fill_random_block(mini, dim, rng);
+        edgevector::HNSWGraph g2(mini.base(), mini.record_bytes(), dim,
+                                 static_cast<std::uint32_t>(m));
+        for (std::uint32_t i = 0; i < m; ++i) {
+            g2.insert(i);
+        }
+        bool all_ok = true;
+        for (std::uint32_t i = 0; i < m; ++i) {
+            if (!g2.remove(i)) {
+                all_ok = false;
+                break;
+            }
+            for (std::size_t d = 0; d < dim; ++d) {
+                raw[d] = dist(rng);
+            }
+            edgevector::quantize(raw.data(), dim, mini.record(i));
+            if (!g2.reinsert(i)) {
+                all_ok = false;
+                break;
+            }
+        }
+        check(all_ok && g2.validate_integrity(),
+              "reclaiming every slot (entry point included) keeps integrity");
+
+        bool all_selffind = true;
+        for (std::uint32_t i = 0; i < m; i += 6u) {
+            const std::uint32_t f =
+                g2.search(mini.record(i), 10u, 60u, res);
+            if (!(f > 0u && res[0].id == i && res[0].distance == 0u)) {
+                all_selffind = false;
+            }
+        }
+        check(all_selffind,
+              "every sampled reclaimed vector finds itself at distance 0");
+    }
+
+    // Single-node graph: reclaim the only node (entry bootstrap path).
+    {
+        RecordBlock solo(dim, 1);
+        fill_random_block(solo, dim, rng);
+        edgevector::HNSWGraph g3(solo.base(), solo.record_bytes(), dim, 1u);
+        g3.insert(0u);
+        g3.remove(0u);
+        for (std::size_t d = 0; d < dim; ++d) {
+            raw[d] = dist(rng);
+        }
+        edgevector::quantize(raw.data(), dim, solo.record(0));
+        check(g3.reinsert(0u) && g3.validate_integrity(),
+              "reclaiming the only node in a graph works");
+        const std::uint32_t f = g3.search(solo.record(0), 1u, 8u, res);
+        check(f == 1u && res[0].id == 0u && res[0].distance == 0u,
+              "the reclaimed sole node finds itself");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -817,6 +961,7 @@ int main() {
     test_delete_and_filter(dim);
     test_reranked_accuracy(graph, floats, n, dim);
     test_parallel_build(graph, data, dim, n);
+    test_slot_reclamation(dim);
 
     std::printf("\n=== %s ===\n",
                 (g_failures == 0) ? "ALL CASES PASSED" : "FAILURES DETECTED");

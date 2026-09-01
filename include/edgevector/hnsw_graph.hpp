@@ -35,11 +35,21 @@
 // route traversal. NOTE: a highly selective filter degrades toward a scan of
 // the reachable graph, as in every filtered-HNSW implementation.
 //
-// DELETION
-// --------
+// DELETION AND SLOT RECLAMATION
+// -----------------------------
 // remove(id) soft-deletes: the node stays in the graph as a routing waypoint
 // (links intact) but is never returned by queries. restore(id) undoes it.
 // Tombstones persist in the graph file (format v2).
+//
+// reinsert(id) RECLAIMS a tombstoned slot for a new vector: after the caller
+// has overwritten the vector bytes at index `id` in the external block, it
+// exhaustively unlinks the id from every neighbor list in the graph (a full
+// O(total links) sweep - correct by construction, milliseconds at 100k
+// vectors - rather than a heuristic local repair), repairs the entry point
+// if the reclaimed node held it, draws a fresh level, and re-runs the
+// standard insert linking against the new bytes. Requiring the tombstone
+// first (remove -> overwrite bytes -> reinsert) makes accidental clobbering
+// impossible. Serial only: no queries or builds may run concurrently.
 //
 // ZERO-ALLOCATION QUERY PATH (CLAUDE.md section 3)
 // ------------------------------------------------
@@ -462,6 +472,66 @@ public:
         return ((deleted_[id >> 6u] >> (id & 63u)) & 1ull) != 0ull;
     }
 
+    // Slot reclamation: relinks a tombstoned id around the NEW vector bytes
+    // the caller has already written at index `id` of the external block.
+    // Workflow: remove(id) -> overwrite the bytes -> reinsert(id). Returns
+    // false unless the id is inserted AND currently deleted. The id keeps
+    // counting toward size(); deleted_count() drops by one. Cost is one full
+    // sweep of the graph's link lists plus a normal insert. Serial only:
+    // must not run concurrently with queries, builds, or other mutations.
+    bool reinsert(std::uint32_t id) {
+        if (id >= capacity_ || levels_[id] == kNotInserted ||
+            !is_deleted(id)) {
+            return false;
+        }
+
+        unlink_everywhere(id);
+
+        // Entry repair: if the reclaimed node was the entry point, promote
+        // the highest-level other node (or fall back to the empty-graph
+        // bootstrap when this is the only node).
+        if (has_entry_ && entry_ == id) {
+            bool found = false;
+            std::uint32_t best = 0u;
+            std::uint32_t best_level = 0u;
+            for (std::uint32_t u = 0u; u < capacity_; ++u) {
+                if (u == id || levels_[u] == kNotInserted) {
+                    continue;
+                }
+                const std::uint32_t ul =
+                    static_cast<std::uint32_t>(levels_[u]);
+                if (!found || ul > best_level) {
+                    found = true;
+                    best = u;
+                    best_level = ul;
+                }
+            }
+            if (found) {
+                entry_ = best;
+                entry_level_ = best_level;
+            } else {
+                has_entry_ = false;
+                entry_ = 0u;
+                entry_level_ = 0u;
+            }
+        }
+
+        // Fresh level and zeroed link storage, then clear the tombstone and
+        // relink against the caller's new bytes.
+        const std::uint32_t level = random_level();
+        links_[id].assign(static_cast<std::size_t>(m0_) +
+                              static_cast<std::size_t>(level) * m_,
+                          0u);
+        counts_[id].assign(static_cast<std::size_t>(level) + 1u, 0u);
+        levels_[id] = static_cast<std::uint8_t>(level);
+
+        deleted_[id >> 6u] &= ~(1ull << (id & 63u));
+        --deleted_count_;
+
+        link_node(*default_ctx_, id, level, /*locked=*/false);
+        return true;
+    }
+
     // QUERY CRITICAL PATH: zero allocation, no system calls, noexcept.
     // Writes up to k results into `out`, ascending by (Hamming distance, id),
     // and returns how many were written. `ef` is the layer-0 beam width,
@@ -790,6 +860,26 @@ private:
         counts_[id].assign(static_cast<std::size_t>(level) + 1u, 0u);
         levels_[id] = static_cast<std::uint8_t>(level);
 
+        link_node(ctx, id, level, locked);
+
+        if (locked) {
+#if defined(EDGEVECTOR_HAS_THREADS)
+            std::lock_guard<std::mutex> guard(entry_mutex_);
+            ++size_;
+#endif
+        } else {
+            ++size_;
+        }
+        return true;
+    }
+
+    // The linking core, shared by insert_impl() and reinsert(): assumes
+    // levels_[id] is set and links_[id]/counts_[id] are allocated and zeroed.
+    // Handles the empty-graph bootstrap, the descent, per-layer neighbor
+    // selection with bidirectional links, and the entry-point update. Does
+    // NOT touch size_ (callers differ on whether the node is new).
+    void link_node(SearchContext& ctx, std::uint32_t id, std::uint32_t level,
+                   bool locked) {
         // Entry bootstrap / snapshot.
         std::uint32_t ep = 0u;
         std::uint32_t start_level = 0u;
@@ -800,8 +890,7 @@ private:
                 entry_ = id;
                 entry_level_ = level;
                 has_entry_ = true;
-                ++size_;
-                return true;
+                return;
             }
             ep = entry_;
             start_level = entry_level_;
@@ -811,8 +900,7 @@ private:
                 entry_ = id;
                 entry_level_ = level;
                 has_entry_ = true;
-                ++size_;
-                return true;
+                return;
             }
             ep = entry_;
             start_level = entry_level_;
@@ -892,16 +980,40 @@ private:
                 entry_ = id;
                 entry_level_ = level;
             }
-            ++size_;
 #endif
         } else {
             if (level > entry_level_) {
                 entry_ = id;
                 entry_level_ = level;
             }
-            ++size_;
         }
-        return true;
+    }
+
+    // Removes every link pointing at `id` from every other node's slot lists
+    // (order within a list is not meaningful in HNSW, so removal compacts by
+    // swapping with the last slot). One full O(total links) sweep; the
+    // exhaustive form is chosen over heuristic local repair because it
+    // leaves no dangling edge by construction. Serial build path only.
+    void unlink_everywhere(std::uint32_t id) {
+        for (std::uint32_t u = 0u; u < capacity_; ++u) {
+            if (u == id || levels_[u] == kNotInserted) {
+                continue;
+            }
+            const std::uint32_t ul = static_cast<std::uint32_t>(levels_[u]);
+            for (std::uint32_t l = 0u; l <= ul; ++l) {
+                std::uint32_t& cnt = counts_[u][l];
+                std::uint32_t* slots = link_slots(u, l);
+                std::uint32_t i = 0u;
+                while (i < cnt) {
+                    if (slots[i] == id) {
+                        slots[i] = slots[cnt - 1u];
+                        --cnt;
+                    } else {
+                        ++i;
+                    }
+                }
+            }
+        }
     }
 
     // Shared structural invariants, used by validate_integrity() and the

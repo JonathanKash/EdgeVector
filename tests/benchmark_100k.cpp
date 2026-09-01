@@ -173,6 +173,7 @@ void run_scenario(const char* name, bool clustered, bool full_report) {
         // Parallel build on a throwaway graph: the serial graph stays the
         // one measured below so recall/latency numbers remain comparable.
         double par_build_s = 0.0;
+        double reclaim_ms = 0.0;
         unsigned hw_threads = 1u;
         bool par_ok = false;
         {
@@ -194,6 +195,18 @@ void run_scenario(const char* name, bool clustered, bool full_report) {
                 par.insert_batch(ids.data(), kN, hw_threads);
             par_build_s = seconds_since(t0);
             par_ok = (inserted == kN) && par.validate_integrity();
+
+            // Slot-reclamation latency on the throwaway graph (bytes are
+            // shared with the measured graph, so they stay unchanged: the
+            // remove -> reinsert cycle costs the same either way).
+            t0 = Clock::now();
+            for (std::uint32_t r = 0u; r < 100u; ++r) {
+                const std::uint32_t id = r * 997u;
+                par.remove(id);
+                par.reinsert(id);
+            }
+            reclaim_ms = 1000.0 * seconds_since(t0) / 100.0;
+            par_ok = par_ok && par.validate_integrity();
         }
 
         std::printf("| Stage | Time |\n|---|---|\n");
@@ -203,6 +216,8 @@ void run_scenario(const char* name, bool clustered, bool full_report) {
                     "integrity %s) |\n",
                     hw_threads, par_build_s, build_s / par_build_s,
                     par_ok ? "validated" : "FAILED");
+        std::printf("| Reclaim one slot (remove + reinsert), avg of 100 | %.2f ms |\n",
+                    reclaim_ms);
         std::printf("| Save graph | %.3f s |\n", save_s);
         std::printf("| Load graph (startup cost with persistence) | %.3f s |\n",
                     load_s);

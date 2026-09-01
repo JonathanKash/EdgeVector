@@ -16,8 +16,11 @@ zero dependencies — with a two-stage retrieval pipeline that reaches
   `SearchContext` scratch pools for queries, and a striped-lock parallel
   build: 100k vectors in **7.9 s on 12 threads vs 64.3 s serial (8.1x)**,
   validated by a full referential-integrity sweep after every parallel build
-- **Soft deletion and filtered search** — tombstones plus caller-supplied
-  allow-bitmaps, composable, persisted in the graph file
+- **Soft deletion, filtered search, and slot reclamation** — tombstones plus
+  caller-supplied allow-bitmaps, composable, persisted in the graph file; a
+  tombstoned slot can be reclaimed for a brand-new vector in ~2.9 ms at 100k
+  (`remove` → overwrite bytes → `reinsert`), leaving zero dangling edges by
+  construction
 - **~0.05 s startup at 100k vectors** — mmap the codes, load the prebuilt
   graph (~1,400x faster than rebuilding)
 - **Learned ITQ rotation** for anisotropic (real-embedding-shaped) data:
@@ -69,6 +72,7 @@ removes.
 | Quantized vectors (RAM) | 6.4 MB (float32 equivalent: 204.8 MB — 32x) |
 | Graph links + scratch | 15.0 MB |
 | Build (one-time): 1 thread / 12 threads | 64.3 s / **7.9 s** (8.1x, integrity-validated) |
+| Reclaim one slot (remove + relink new vector) | **2.9 ms** (avg of 100, integrity-validated) |
 | Load prebuilt graph at startup | 0.035 s (~1,800x faster than rebuilding) |
 
 ```mermaid
@@ -187,6 +191,12 @@ graph.search(ctx, q, 10, 50, by_hamming);  // thread-safe on a const graph
 graph.remove(42);                          // tombstone: gone from results,
 graph.restore(42);                         //   still routes; persisted (v2)
 
+// Slot reclamation: replace a dead slot's vector with a brand-new one.
+graph.remove(42);
+quantize(new_floats, dim, base + 42 * rb); // caller overwrites the bytes...
+graph.reinsert(42);                        // ...then the graph relinks: ~3 ms
+                                           //   at 100k, no dangling edges
+
 std::vector<std::uint64_t> allow((n + 63) / 64, 0);
 // ... set one bit per permitted id ...
 graph.search(ctx, q, 10, 50, by_hamming, allow.data());
@@ -250,7 +260,9 @@ round-trips and header-corruption rejection, mapped record alignment, HNSW
 recall gates at two scales, result ordering, the re-ranking accuracy ladder
 against float32 ground truth, graph persistence round-trips (bitwise-identical
 results and surviving tombstones after reload), context isolation plus a
-4-thread concurrency test, delete/restore/filter composition, ITQ invariants
+4-thread concurrency test, delete/restore/filter composition, slot
+reclamation (new-vector serving, no-dangling-edge integrity after churn of
+100 slots, full entry-point turnover, single-node bootstrap), ITQ invariants
 (orthogonality, exact cosine preservation, monotone objective, determinism,
 hostile-file rejection, end-to-end recall gain), concurrent construction
 (single-thread batch bit-identical to serial insert; 4-thread build passing
@@ -266,10 +278,12 @@ including bit-identical ITQ training results vs x86-64 — is validated.
 
 ## Status and roadmap
 
-v0.5. Known limitations, in priority order:
+v0.6. Known limitations, in priority order:
 
-1. **Insert-only capacity** — soft delete exists, but slots are never
-   reclaimed and capacity is fixed at construction
+1. **Capacity is fixed at construction** — slots can now be reclaimed for
+   new vectors (`remove` → overwrite → `reinsert`, ~2.9 ms each at 100k,
+   serial-only, O(total links) per reclaim by design: exhaustive unlinking
+   over heuristic repair), but the total slot count cannot grow
 2. **Highly selective filters degrade** toward a scan of the reachable graph
    (true of every filtered-HNSW implementation; documented, not hidden)
 3. **ARM validated for correctness, not yet for performance** — all suites
