@@ -33,6 +33,15 @@
 #include <cstring>
 #include <cmath>
 
+// The Hamming kernel has a hand-written AVX2 path (nibble-LUT popcount via
+// vpshufb + vpsadbw) that is EXACTLY equivalent to the portable path - the
+// test suite gates bit-identical results against a naive per-bit reference.
+// Define EDGEVECTOR_NO_AVX2 to force the portable kernel on AVX2 hardware.
+#if defined(__AVX2__) && !defined(EDGEVECTOR_NO_AVX2)
+#define EDGEVECTOR_USE_AVX2 1
+#include <immintrin.h>
+#endif
+
 namespace edgevector {
 
 namespace detail {
@@ -83,23 +92,79 @@ inline void quantize(const float* src, std::size_t dim, std::uint8_t* dst) noexc
 
 // Hamming distance between two quantized vectors of dimension `dim`.
 // Both buffers are 8-byte aligned and padded_bytes(dim) long.
+//
+// Two implementations with bit-identical results (test-gated):
+//   - AVX2: 32 bytes per step via the classic nibble-LUT popcount
+//     (vpshufb twice + vpsadbw), horizontally summed at the end.
+//   - portable: four independent scalar POPCNT accumulators so the adds do
+//     not serialize on one dependency chain.
+// Padding bits are zero in both operands, so they never contribute either
+// way.
 inline std::uint32_t hamming_distance(const std::uint8_t* a,
                                       const std::uint8_t* b,
                                       std::size_t dim) noexcept {
     const std::size_t words = detail::word_count(dim);
-    std::uint32_t distance = 0u;
+    std::size_t w = 0;
+    std::uint64_t distance = 0u;
 
-    for (std::size_t w = 0; w < words; ++w) {
+#if defined(EDGEVECTOR_USE_AVX2)
+    if (words >= 4u) {
+        const __m256i low_mask = _mm256_set1_epi8(0x0f);
+        const __m256i lut = _mm256_setr_epi8(
+            0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+            0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
+        __m256i acc = _mm256_setzero_si256();
+        for (; w + 4u <= words; w += 4u) {
+            const __m256i va = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(a + w * 8u));
+            const __m256i vb = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i*>(b + w * 8u));
+            const __m256i x = _mm256_xor_si256(va, vb);
+            const __m256i lo = _mm256_and_si256(x, low_mask);
+            const __m256i hi =
+                _mm256_and_si256(_mm256_srli_epi16(x, 4), low_mask);
+            const __m256i cnt = _mm256_add_epi8(
+                _mm256_shuffle_epi8(lut, lo), _mm256_shuffle_epi8(lut, hi));
+            acc = _mm256_add_epi64(acc,
+                                   _mm256_sad_epu8(cnt, _mm256_setzero_si256()));
+        }
+        std::uint64_t lanes[4]; // storeu: old MinGW cannot 32-align the stack
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(lanes), acc);
+        distance = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+    }
+    for (; w < words; ++w) {
         std::uint64_t wa;
         std::uint64_t wb;
         std::memcpy(&wa, a + w * 8u, sizeof(std::uint64_t));
         std::memcpy(&wb, b + w * 8u, sizeof(std::uint64_t));
-
-        // Padding bits are zero in both operands, so they never contribute.
-        distance += static_cast<std::uint32_t>(__builtin_popcountll(wa ^ wb));
+        distance += static_cast<std::uint64_t>(__builtin_popcountll(wa ^ wb));
     }
+#else
+    std::uint64_t d0 = 0u;
+    std::uint64_t d1 = 0u;
+    std::uint64_t d2 = 0u;
+    std::uint64_t d3 = 0u;
+    for (; w + 4u <= words; w += 4u) {
+        std::uint64_t wa[4];
+        std::uint64_t wb[4];
+        std::memcpy(wa, a + w * 8u, 4u * sizeof(std::uint64_t));
+        std::memcpy(wb, b + w * 8u, 4u * sizeof(std::uint64_t));
+        d0 += static_cast<std::uint64_t>(__builtin_popcountll(wa[0] ^ wb[0]));
+        d1 += static_cast<std::uint64_t>(__builtin_popcountll(wa[1] ^ wb[1]));
+        d2 += static_cast<std::uint64_t>(__builtin_popcountll(wa[2] ^ wb[2]));
+        d3 += static_cast<std::uint64_t>(__builtin_popcountll(wa[3] ^ wb[3]));
+    }
+    distance = (d0 + d1) + (d2 + d3);
+    for (; w < words; ++w) {
+        std::uint64_t wa;
+        std::uint64_t wb;
+        std::memcpy(&wa, a + w * 8u, sizeof(std::uint64_t));
+        std::memcpy(&wb, b + w * 8u, sizeof(std::uint64_t));
+        distance += static_cast<std::uint64_t>(__builtin_popcountll(wa ^ wb));
+    }
+#endif
 
-    return distance;
+    return static_cast<std::uint32_t>(distance);
 }
 
 // Estimated cosine similarity recovered from a Hamming distance:
@@ -189,15 +254,28 @@ inline void build_asymmetric_table(const float* q, std::size_t dim,
 
 // Scores one quantized vector against a table built by
 // build_asymmetric_table. Higher is more similar. Zero allocation; on the
-// re-ranking path of search_reranked.
+// re-ranking path of search_reranked. Four independent accumulators keep the
+// dependent-load chain from serializing (summation order differs from a
+// single accumulator by ordinary float reassociation; the exactness test
+// gates the result against a double-precision reference).
 inline float asymmetric_score(const float* table, const std::uint8_t* x,
                               std::size_t dim) noexcept {
     const std::size_t nbytes = padded_bytes(dim);
-    float score = 0.0f;
-    for (std::size_t b = 0; b < nbytes; ++b) {
-        score += table[b * 256u + static_cast<std::size_t>(x[b])];
+    float s0 = 0.0f;
+    float s1 = 0.0f;
+    float s2 = 0.0f;
+    float s3 = 0.0f;
+    std::size_t b = 0;
+    for (; b + 4u <= nbytes; b += 4u) {
+        s0 += table[(b + 0u) * 256u + static_cast<std::size_t>(x[b + 0u])];
+        s1 += table[(b + 1u) * 256u + static_cast<std::size_t>(x[b + 1u])];
+        s2 += table[(b + 2u) * 256u + static_cast<std::size_t>(x[b + 2u])];
+        s3 += table[(b + 3u) * 256u + static_cast<std::size_t>(x[b + 3u])];
     }
-    return score;
+    for (; b < nbytes; ++b) {
+        s0 += table[b * 256u + static_cast<std::size_t>(x[b])];
+    }
+    return (s0 + s1) + (s2 + s3);
 }
 
 } // namespace edgevector

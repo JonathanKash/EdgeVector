@@ -391,6 +391,56 @@ void test_asymmetric_scoring(std::size_t dim) {
     check(worst < 1e-3, name);
 }
 
+// ---------------------------------------------------------------------------
+// Case 7: kernel equivalence — the optimized Hamming kernel (AVX2 nibble-LUT
+// where available, unrolled scalar otherwise) must be bit-identical to a
+// naive per-bit reference at every dimension shape (word-multiple, partial
+// tail, below and above the vector-path threshold).
+// ---------------------------------------------------------------------------
+void test_kernel_equivalence(std::size_t dim) {
+    std::printf("[7] Hamming kernel equivalence (dim = %zu)\n", dim);
+
+    std::mt19937 rng(71);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> raw(dim);
+    QuantizedBuffer qa(dim);
+    QuantizedBuffer qb(dim);
+    const std::size_t nbytes = edgevector::padded_bytes(dim);
+
+    bool all_equal = true;
+    for (int t = 0; t < 200 && all_equal; ++t) {
+        for (std::size_t i = 0; i < dim; ++i) {
+            raw[i] = dist(rng);
+        }
+        edgevector::quantize(raw.data(), dim, qa.data());
+        for (std::size_t i = 0; i < dim; ++i) {
+            raw[i] = dist(rng);
+        }
+        edgevector::quantize(raw.data(), dim, qb.data());
+
+        // Naive per-bit reference over the whole padded buffer (padding is
+        // zero on both sides, so it contributes nothing).
+        std::uint32_t naive = 0;
+        for (std::size_t byte = 0; byte < nbytes; ++byte) {
+            std::uint8_t x =
+                static_cast<std::uint8_t>(qa.data()[byte] ^ qb.data()[byte]);
+            while (x != 0u) {
+                naive += (x & 1u);
+                x = static_cast<std::uint8_t>(x >> 1u);
+            }
+        }
+        if (edgevector::hamming_distance(qa.data(), qb.data(), dim) != naive) {
+            all_equal = false;
+        }
+    }
+
+    char name[96];
+    std::snprintf(name, sizeof(name),
+                  "dim %zu: 200 random pairs bit-identical to the naive "
+                  "reference", dim);
+    check(all_equal, name);
+}
+
 } // namespace
 
 int main() {
@@ -404,6 +454,11 @@ int main() {
     test_ranking_preservation();
     test_asymmetric_scoring(512);
     test_asymmetric_scoring(100);
+    test_kernel_equivalence(64);   // one word: below the AVX2 threshold
+    test_kernel_equivalence(100);  // partial tail word
+    test_kernel_equivalence(192);  // three words: vector path + tail
+    test_kernel_equivalence(512);  // pure vector path
+    test_kernel_equivalence(1000); // vector path + partial tail
 
     std::printf("\n=== %s ===\n",
                 (g_failures == 0) ? "ALL CASES PASSED" : "FAILURES DETECTED");

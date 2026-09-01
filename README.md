@@ -7,9 +7,16 @@ zero dependencies — with a two-stage retrieval pipeline that reaches
 
 - **32x smaller vectors in RAM** — 512-d float32 (2,048 B) quantizes to 64 B
 - **recall@10 = 0.995–1.000 against true float32 ground truth** (embedding-like
-  data, 100k vectors) via exact re-ranking, while RAM holds only the codes —
-  the full-precision vectors can stay on flash and each query touches just
-  `ef` of them
+  data, 100k vectors) via exact re-ranking at **~7,700 QPS single-thread**,
+  while RAM holds only the codes — the full-precision vectors can stay on
+  flash and each query touches just `ef` of them
+- **Scale-validated at 1M vectors**: 12-thread build in 72 s, 0.28 s startup,
+  64 MB of codes in RAM, recall@10 = 0.988 at 118 µs/query (~8,500 QPS,
+  1 thread) — 50x faster than an exact scan
+- **Memory-latency-aware traversal and an AVX2 Hamming kernel** (software
+  prefetching plus a nibble-LUT popcount, both gated bit-identical to naive
+  references by tests): ~3x query speedup and 2.5x serial-build speedup over
+  the unprefetched implementation, with recall unchanged to the last digit
 - **Zero-allocation queries, proven** — every search mode is covered by tests
   that replace the global `operator new` and require **zero** allocations
 - **Concurrent queries and concurrent construction** — per-thread
@@ -56,13 +63,13 @@ an application actually experiences — and against exact binary ground truth
 
 | ef | recall@10 (binary GT) | float GT, Hamming rank | float GT, asym re-rank | float GT, **exact re-rank** | lat Hamming | lat asym | lat exact |
 |---|---|---|---|---|---|---|---|
-| 10 | 0.899 | 0.262 | 0.262 | **0.262** | 28 µs | 53 µs | 57 µs |
-| 25 | 0.992 | 0.264 | 0.319 | **0.514** | 79 µs | 109 µs | 131 µs |
-| 50 | 1.000 | 0.264 | 0.328 | **0.775** | 126 µs | 219 µs | 343 µs |
-| 100 | 1.000 | 0.264 | 0.330 | **0.995** | 295 µs | 299 µs | 494 µs |
-| 200 | 1.000 | 0.264 | 0.330 | **1.000** | 534 µs | 595 µs | 985 µs |
+| 10 | 0.899 | 0.262 | 0.262 | **0.262** | 10 µs | 20 µs | 19 µs |
+| 25 | 0.992 | 0.264 | 0.319 | **0.514** | 24 µs | 33 µs | 40 µs |
+| 50 | 1.000 | 0.264 | 0.328 | **0.775** | 42 µs | 50 µs | 72 µs |
+| 100 | 1.000 | 0.264 | 0.330 | **0.995** | 69 µs | 78 µs | 130 µs |
+| 200 | 1.000 | 0.264 | 0.330 | **1.000** | 158 µs | 169 µs | 295 µs |
 
-Read the last column: **~2,000 QPS single-thread at 99.5% float-exact
+Read the last column: **~7,700 QPS single-thread at 99.5% float-exact
 recall** from a RAM index 32x smaller than the float vectors. The graph
 itself is essentially perfect (binary-GT recall 1.000 from ef = 50); the
 Hamming-rank column shows the 1-bit representation ceiling that re-ranking
@@ -72,9 +79,31 @@ removes.
 |---|---|
 | Quantized vectors (RAM) | 6.4 MB (float32 equivalent: 204.8 MB — 32x) |
 | Graph links + scratch | 15.0 MB |
-| Build (one-time): 1 thread / 12 threads | 64.3 s / **7.9 s** (8.1x, integrity-validated) |
-| Reclaim one slot (remove + relink new vector) | **2.9 ms** (avg of 100, integrity-validated) |
-| Load prebuilt graph at startup | 0.035 s (~1,800x faster than rebuilding) |
+| Build (one-time): 1 thread / 12 threads | 25.8 s / **7.6 s** (integrity-validated) |
+| Reclaim one slot (remove + relink new vector) | **2.4 ms** (avg of 100, integrity-validated) |
+| Load prebuilt graph at startup | 0.033 s (~780x faster than rebuilding) |
+
+### 1M vectors: the scale check
+
+Same recipe at 1,000,000 × 512-d (clustered), single-thread queries:
+
+| | |
+|---|---|
+| Build (insert_batch, 12 threads, integrity-validated) | 71.9 s |
+| Load prebuilt graph at startup | 0.28 s |
+| Quantized vectors (RAM) | 64 MB (float32 equivalent: 2,048 MB) |
+| Graph links + scratch | 150 MB |
+| Exact binary scan baseline | 5.90 ms/query (169 QPS) |
+
+| ef | recall@10 (binary GT) | mean latency | QPS (1 thread) |
+|---|---|---|---|
+| 10 | 0.528 | 21 µs | 48,152 |
+| 50 | 0.936 | 75 µs | 13,289 |
+| 100 | 0.988 | 118 µs | **8,475** |
+
+(Float32-truth metrics at 1M are omitted — the exact ground truth would need
+2 GB of resident floats; the 100k tables above carry the accuracy story,
+this one carries scale.)
 
 ```mermaid
 xychart-beta
@@ -270,9 +299,9 @@ rot.rotate_quantize(query_floats, tmp.data(), q);
 
 | Header | Role |
 |---|---|
-| `quantize_math.hpp` | float32 → 1 bit/component sign quantization; Hamming distance over `uint64_t` words via `__builtin_popcountll`; SimHash cosine estimator; **asymmetric ADC scorer** (per-byte lookup tables for `dot(q_float, sign(x))`) |
+| `quantize_math.hpp` | float32 → 1 bit/component sign quantization; Hamming distance with an AVX2 nibble-LUT popcount path and an ILP-unrolled portable path (both test-gated bit-identical to a naive per-bit reference); SimHash cosine estimator; **asymmetric ADC scorer** (per-byte lookup tables for `dot(q_float, sign(x))`) |
 | `mmap_storage.hpp` | Validated on-disk vector format (`EVEC` v1) and a zero-copy, read-only `mmap` reader. POSIX primary; Win32 shim confined to `detail::` for development |
-| `hnsw_graph.hpp` | HNSW (Malkov & Yashunin) over the quantized block: build with heuristic neighbor selection + keep-pruned backfill; three zero-allocation search modes; per-thread `SearchContext`s; soft-delete tombstones and allow-bitmap filtering; validated graph persistence (`EVHG` v2, loads v1) |
+| `hnsw_graph.hpp` | HNSW (Malkov & Yashunin) over the quantized block: build with heuristic neighbor selection + keep-pruned backfill; three zero-allocation search modes with software-prefetched traversal (beam search is memory-latency bound; issuing the neighbor loads early is worth ~3x); per-thread `SearchContext`s; soft-delete tombstones and allow-bitmap filtering; validated graph persistence (`EVHG` v2, loads v1) |
 | `itq_rotation.hpp` | Learned ITQ rotation (rotation-only, cosine-preserving): double-precision training with an inverse-free Newton–Schulz Procrustes solver; allocation-free `rotate()`/`rotate_quantize()`; validated `EVRT` persistence |
 
 Engineering rules the code holds itself to (and tests enforce):
@@ -309,7 +338,9 @@ make bench        # the benchmarks reported above (-DNDEBUG; pass a scenario
 ```
 
 The suites cover: quantization bit-exactness and padding hygiene, cosine
-parity gates, ADC-table exactness against a naive `dot(q, sign(x))`, storage
+parity gates, Hamming-kernel equivalence (AVX2 and portable paths gated
+bit-identical to a naive per-bit reference across five dimension shapes),
+ADC-table exactness against a naive `dot(q, sign(x))`, storage
 round-trips and header-corruption rejection, mapped record alignment, HNSW
 recall gates at two scales, result ordering, the re-ranking accuracy ladder
 against float32 ground truth, graph persistence round-trips (bitwise-identical
@@ -334,7 +365,7 @@ including bit-identical ITQ training results vs x86-64 — is validated.
 
 ## Status and roadmap
 
-v0.7. Known limitations, in priority order:
+v0.8. Known limitations, in priority order:
 
 1. **Dynamic operations are serial** — `reinsert` (~2.9 ms each at 100k;
    O(total links) by design, exhaustive unlinking over heuristic repair) and

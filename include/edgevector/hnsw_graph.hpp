@@ -125,6 +125,16 @@
 
 #include "edgevector/quantize_math.hpp"
 
+// Software prefetch for the traversal hot loops. Beam search is memory-
+// latency bound at scale: every candidate distance is a random cache-line
+// fetch, so issuing the loads for a whole neighbor list before computing
+// hides most of that latency. Read-only, high temporal locality hint.
+#if defined(__GNUC__) || defined(__clang__)
+#define EDGEVECTOR_PREFETCH(p) __builtin_prefetch((p), 0, 3)
+#else
+#define EDGEVECTOR_PREFETCH(p) ((void)0)
+#endif
+
 namespace edgevector {
 
 struct SearchResult {
@@ -263,6 +273,7 @@ private:
                                   static_cast<std::size_t>(m0) + 2u]);
         selected_.reset(new std::uint32_t[static_cast<std::size_t>(m0) + 1u]);
         neigh_buf_.reset(new std::uint32_t[static_cast<std::size_t>(m0)]);
+        stage_buf_.reset(new std::uint32_t[static_cast<std::size_t>(m0)]);
         cand_heap_.init(cand_buf_.get(), capacity + 1u);
         res_heap_.init(res_buf_.get(), ef_limit + 1u);
     }
@@ -290,6 +301,7 @@ private:
     std::unique_ptr<detail::Candidate[]> select_buf_; // build path
     std::unique_ptr<std::uint32_t[]> selected_;       // build path
     std::unique_ptr<std::uint32_t[]> neigh_buf_;      // build path (locked copies)
+    std::unique_ptr<std::uint32_t[]> stage_buf_;      // unvisited-neighbor staging
     detail::FixedHeap<detail::MinHeapCmp> cand_heap_;
     detail::FixedHeap<detail::MaxHeapCmp> res_heap_;
 };
@@ -666,6 +678,9 @@ public:
 
         build_asymmetric_table(q_floats, dim_, ctx.asym_table_.get());
         const detail::Candidate* raw = ctx.res_heap_.data();
+        for (std::uint32_t i = 0u; i < found; ++i) {
+            EDGEVECTOR_PREFETCH(vec(raw[i].id));
+        }
         for (std::uint32_t i = 0u; i < found; ++i) {
             ctx.scored_buf_[i] = detail::Scored{
                 asymmetric_score(ctx.asym_table_.get(), vec(raw[i].id), dim_),
@@ -1213,6 +1228,9 @@ private:
             std::uint32_t n = 0u;
             const std::uint32_t* nb = neighbors_of(ep, layer, n);
             for (std::uint32_t i = 0u; i < n; ++i) {
+                EDGEVECTOR_PREFETCH(vec(nb[i]));
+            }
+            for (std::uint32_t i = 0u; i < n; ++i) {
                 const std::uint32_t d = distance_to(q, nb[i]);
                 if (d < ep_dist) {
                     ep_dist = d;
@@ -1321,12 +1339,27 @@ private:
             const std::uint32_t* nb =
                 locked ? neighbors_snapshot(ctx, c.id, layer, n)
                        : neighbors_of(c.id, layer, n);
+
+            // Three order-preserving passes (results stay bit-identical to
+            // the fused loop): prefetch the visited flags, then stage the
+            // unvisited neighbors while prefetching their vectors, then
+            // compute distances with the loads already in flight.
+            for (std::uint32_t i = 0u; i < n; ++i) {
+                EDGEVECTOR_PREFETCH(&ctx.visited_[nb[i]]);
+            }
+            std::uint32_t n_stage = 0u;
             for (std::uint32_t i = 0u; i < n; ++i) {
                 const std::uint32_t e = nb[i];
                 if (ctx.is_visited(e)) {
                     continue;
                 }
                 ctx.mark_visited(e);
+                ctx.stage_buf_[n_stage] = e;
+                ++n_stage;
+                EDGEVECTOR_PREFETCH(vec(e));
+            }
+            for (std::uint32_t j = 0u; j < n_stage; ++j) {
+                const std::uint32_t e = ctx.stage_buf_[j];
                 const std::uint32_t de = distance_to(q, e);
                 const bool beam_open =
                     ctx.res_heap_.size() < ef ||
