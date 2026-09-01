@@ -1,9 +1,17 @@
-# EdgeVector :: unit test build for the quantize_math module.
-# The library is header-only, so the test translation unit is the whole build.
+# EdgeVector :: unit test build.
+# The library is header-only, so each test translation unit is a whole build.
+#
+# Cross-compilation / emulation knobs:
+#   ARCH   - architecture flags (default: -march=native). For aarch64 use
+#            e.g. `make ARCH=-march=armv8-a CXX=aarch64-linux-gnu-g++`.
+#   RUNNER - command prefix for executing test binaries (default: none). For
+#            QEMU user-mode: `RUNNER="qemu-aarch64 -L /usr/aarch64-linux-gnu"`.
 
 CXX ?= g++
-CXXFLAGS := -std=c++17 -O3 -march=native -Wall -Wextra -Werror
+ARCH ?= -march=native
+CXXFLAGS := -std=c++17 -O3 $(ARCH) -Wall -Wextra -Werror
 INCLUDES := -I../include
+RUNNER ?=
 
 # Release configuration: identical flags plus -DNDEBUG, which strips the
 # asserts from the query hot path (MMapStorage::vector and the HNSW heaps).
@@ -39,14 +47,21 @@ INTEG_HEADERS := ../include/edgevector/hnsw_graph.hpp \
                  ../include/edgevector/mmap_storage.hpp \
                  ../include/edgevector/quantize_math.hpp
 
+ITQ_TARGET := test_itq_rotation$(EXE)
+ITQ_SRC := test_itq_rotation.cpp
+ITQ_HEADERS := ../include/edgevector/itq_rotation.hpp \
+               ../include/edgevector/hnsw_graph.hpp \
+               ../include/edgevector/quantize_math.hpp
+
 RELEASE_TARGETS := test_quantize_math_release$(EXE) \
                    test_mmap_storage_release$(EXE) \
                    test_hnsw_graph_release$(EXE) \
-                   test_integration_release$(EXE)
+                   test_integration_release$(EXE) \
+                   test_itq_rotation_release$(EXE)
 
-.PHONY: all run release run-release clean
+.PHONY: all run release run-release bench clean
 
-all: $(TARGET) $(STORAGE_TARGET) $(HNSW_TARGET) $(INTEG_TARGET)
+all: $(TARGET) $(STORAGE_TARGET) $(HNSW_TARGET) $(INTEG_TARGET) $(ITQ_TARGET)
 
 $(TARGET): $(SRC) $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $(SRC) -o $(TARGET)
@@ -60,12 +75,16 @@ $(HNSW_TARGET): $(HNSW_SRC) $(HNSW_HEADERS)
 $(INTEG_TARGET): $(INTEG_SRC) $(INTEG_HEADERS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $(INTEG_SRC) -o $(INTEG_TARGET)
 
+$(ITQ_TARGET): $(ITQ_SRC) $(ITQ_HEADERS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(ITQ_SRC) -o $(ITQ_TARGET)
+
 # make stops at the first recipe line that exits non-zero, so this fails fast.
-run: $(TARGET) $(STORAGE_TARGET) $(HNSW_TARGET) $(INTEG_TARGET)
-	./$(TARGET)
-	./$(STORAGE_TARGET)
-	./$(HNSW_TARGET)
-	./$(INTEG_TARGET)
+run: $(TARGET) $(STORAGE_TARGET) $(HNSW_TARGET) $(INTEG_TARGET) $(ITQ_TARGET)
+	$(RUNNER) ./$(TARGET)
+	$(RUNNER) ./$(STORAGE_TARGET)
+	$(RUNNER) ./$(HNSW_TARGET)
+	$(RUNNER) ./$(INTEG_TARGET)
+	$(RUNNER) ./$(ITQ_TARGET)
 
 # --- release (-DNDEBUG) -----------------------------------------------------
 
@@ -83,24 +102,26 @@ test_hnsw_graph_release$(EXE): $(HNSW_SRC) $(HNSW_HEADERS)
 test_integration_release$(EXE): $(INTEG_SRC) $(INTEG_HEADERS)
 	$(CXX) $(RELEASE_FLAGS) $(INCLUDES) $(INTEG_SRC) -o $@
 
+test_itq_rotation_release$(EXE): $(ITQ_SRC) $(ITQ_HEADERS)
+	$(CXX) $(RELEASE_FLAGS) $(INCLUDES) $(ITQ_SRC) -o $@
+
 run-release: $(RELEASE_TARGETS)
-	./test_quantize_math_release$(EXE)
-	./test_mmap_storage_release$(EXE)
-	./test_hnsw_graph_release$(EXE)
-	./test_integration_release$(EXE)
+	$(RUNNER) ./test_quantize_math_release$(EXE)
+	$(RUNNER) ./test_mmap_storage_release$(EXE)
+	$(RUNNER) ./test_hnsw_graph_release$(EXE)
+	$(RUNNER) ./test_integration_release$(EXE)
+	$(RUNNER) ./test_itq_rotation_release$(EXE)
 
 # --- benchmark (always -DNDEBUG: assert-enabled numbers are meaningless) ----
 
 BENCH_TARGET := benchmark_100k$(EXE)
 
-$(BENCH_TARGET): benchmark_100k.cpp $(HNSW_HEADERS)
+$(BENCH_TARGET): benchmark_100k.cpp $(HNSW_HEADERS) ../include/edgevector/itq_rotation.hpp
 	$(CXX) $(RELEASE_FLAGS) $(INCLUDES) benchmark_100k.cpp -o $@
 
 bench: $(BENCH_TARGET)
-	./$(BENCH_TARGET)
-
-.PHONY: bench
+	$(RUNNER) ./$(BENCH_TARGET)
 
 clean:
 	rm -f $(TARGET) $(STORAGE_TARGET) $(HNSW_TARGET) $(INTEG_TARGET) \
-	      $(RELEASE_TARGETS) $(BENCH_TARGET)
+	      $(ITQ_TARGET) $(RELEASE_TARGETS) $(BENCH_TARGET)

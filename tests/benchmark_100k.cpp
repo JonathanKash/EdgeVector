@@ -29,6 +29,7 @@
 // ============================================================================
 
 #include "edgevector/hnsw_graph.hpp"
+#include "edgevector/itq_rotation.hpp"
 #include "edgevector/quantize_math.hpp"
 
 #include <algorithm>
@@ -327,15 +328,193 @@ void run_scenario(const char* name, bool clustered, bool full_report) {
     std::fflush(stdout);
 }
 
+// ---------------------------------------------------------------------------
+// ITQ scenario: anisotropic clustered data (dimension d scaled by
+// exp(-4d/dim), the decaying-spectrum shape real embedding data has), with
+// two indexes over the SAME floats — raw sign codes vs ITQ-rotated codes —
+// compared on recall against float32 cosine ground truth. N is 50k here (the
+// scenario builds two graphs and trains a rotation).
+//
+// Note the exact-re-rank columns for the ITQ variant deliberately re-rank
+// with the ORIGINAL floats and the ORIGINAL query: an orthogonal rotation
+// preserves cosine exactly, so the rotated index needs no rotated float
+// corpus.
+// ---------------------------------------------------------------------------
+void run_itq_scenario() {
+    const std::size_t n = 50000;
+    const std::size_t n_queries = 500;
+    const std::size_t n_train = 5000; // subsample for rotation training
+    std::printf("## Scenario: ITQ rotation on anisotropic data "
+                "(N = %zu, %zu queries, spectrum exp(-4d/%zu))\n\n",
+                n, n_queries, kDim);
+    std::fflush(stdout);
+
+    // Anisotropic clustered floats (data rows, then query rows).
+    std::vector<float> floats((n + n_queries) * kDim);
+    {
+        Sampler sampler(true);
+        std::vector<float> scale(kDim);
+        for (std::size_t d = 0; d < kDim; ++d) {
+            scale[d] = std::exp(-4.0f * static_cast<float>(d) /
+                                static_cast<float>(kDim));
+        }
+        for (std::size_t i = 0; i < n + n_queries; ++i) {
+            sampler.draw(floats.data() + i * kDim);
+            for (std::size_t d = 0; d < kDim; ++d) {
+                floats[i * kDim + d] *= scale[d];
+            }
+        }
+    }
+    const float* qfloats = floats.data() + n * kDim;
+
+    // Train the rotation on a corpus subsample.
+    edgevector::ItqRotation rot(kDim);
+    Clock::time_point t0 = Clock::now();
+    if (rot.train(floats.data(), n_train, kDim, /*iterations=*/10,
+                  /*seed=*/42u) != edgevector::ItqStatus::ok) {
+        std::printf("FATAL: ITQ training failed\n");
+        std::exit(1);
+    }
+    std::printf("Rotation trained on %zu samples in %.1f s "
+                "(quantization error %.4f -> %.4f, orthogonality %.1e).\n\n",
+                n_train, seconds_since(t0), rot.error_before_training(),
+                rot.error_after_training(), rot.orthogonality_error());
+    std::fflush(stdout);
+
+    // Two code blocks over the same floats.
+    RecordBlock raw_codes(kDim, n);
+    RecordBlock itq_codes(kDim, n);
+    {
+        std::vector<float> scratch(kDim);
+        for (std::size_t i = 0; i < n; ++i) {
+            edgevector::quantize(floats.data() + i * kDim, kDim,
+                                 raw_codes.record(i));
+            rot.rotate_quantize(floats.data() + i * kDim, scratch.data(),
+                                itq_codes.record(i));
+        }
+    }
+
+    edgevector::HNSWGraph raw_graph(raw_codes.base(), raw_codes.record_bytes(),
+                                    kDim, static_cast<std::uint32_t>(n),
+                                    16u, 200u, 256u, 42u);
+    edgevector::HNSWGraph itq_graph(itq_codes.base(), itq_codes.record_bytes(),
+                                    kDim, static_cast<std::uint32_t>(n),
+                                    16u, 200u, 256u, 42u);
+    t0 = Clock::now();
+    for (std::uint32_t i = 0; i < n; ++i) {
+        raw_graph.insert(i);
+        itq_graph.insert(i);
+    }
+    std::printf("Both graphs built in %.1f s total (1 thread).\n\n",
+                seconds_since(t0));
+    std::fflush(stdout);
+
+    // Float32 cosine ground truth (identical for both variants: orthogonal
+    // rotations preserve cosine).
+    std::vector<std::uint32_t> f32_truth(n_queries * kK);
+    {
+        std::vector<float> inv_norm(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            double s = 0.0;
+            const float* x = floats.data() + i * kDim;
+            for (std::size_t d = 0; d < kDim; ++d) {
+                s += static_cast<double>(x[d]) * static_cast<double>(x[d]);
+            }
+            inv_norm[i] =
+                (s > 0.0) ? static_cast<float>(1.0 / std::sqrt(s)) : 0.0f;
+        }
+        std::vector<std::pair<float, std::uint32_t>> all(n);
+        for (std::size_t qi = 0; qi < n_queries; ++qi) {
+            const float* q = qfloats + qi * kDim;
+            for (std::size_t i = 0; i < n; ++i) {
+                const float* x = floats.data() + i * kDim;
+                float dot = 0.0f;
+                for (std::size_t d = 0; d < kDim; ++d) {
+                    dot += q[d] * x[d];
+                }
+                all[i] = std::make_pair(-dot * inv_norm[i],
+                                        static_cast<std::uint32_t>(i));
+            }
+            std::partial_sort(all.begin(), all.begin() + kK, all.end());
+            for (std::size_t i = 0; i < kK; ++i) {
+                f32_truth[qi * kK + i] = all[i].second;
+            }
+        }
+    }
+
+    std::printf("| ef | raw Hamming | ITQ Hamming | raw asym | ITQ asym | raw exact | ITQ exact |\n");
+    std::printf("|---|---|---|---|---|---|---|\n");
+    std::fflush(stdout);
+
+    std::vector<std::uint64_t> qw(edgevector::padded_bytes(kDim) / 8u, 0u);
+    std::uint8_t* qbits = reinterpret_cast<std::uint8_t*>(qw.data());
+    std::vector<float> qrot(kDim);
+    std::vector<edgevector::SearchResult> hres(kK);
+    std::vector<edgevector::ScoredResult> sres(kK);
+    std::uint32_t got_ids[kK];
+
+    const std::uint32_t ef_sweep[] = {25u, 100u};
+    for (const std::uint32_t ef : ef_sweep) {
+        std::size_t hits[6] = {0, 0, 0, 0, 0, 0};
+        for (std::size_t qi = 0; qi < n_queries; ++qi) {
+            const float* q = qfloats + qi * kDim;
+            const std::uint32_t* truth = &f32_truth[qi * kK];
+
+            // Variant 0: raw codes, quantized query.
+            edgevector::quantize(q, kDim, qbits);
+            std::uint32_t found = raw_graph.search(qbits, kK, ef, hres.data());
+            for (std::uint32_t i = 0; i < found; ++i) got_ids[i] = hres[i].id;
+            hits[0] += overlap10(got_ids, found, truth);
+            found = raw_graph.search_reranked(qbits, q, kK, ef, sres.data());
+            for (std::uint32_t i = 0; i < found; ++i) got_ids[i] = sres[i].id;
+            hits[2] += overlap10(got_ids, found, truth);
+            found = raw_graph.search_exact_reranked(qbits, q, floats.data(),
+                                                    kDim, kK, ef, sres.data());
+            for (std::uint32_t i = 0; i < found; ++i) got_ids[i] = sres[i].id;
+            hits[4] += overlap10(got_ids, found, truth);
+
+            // Variant 1: ITQ codes, rotated query (exact re-rank still uses
+            // the ORIGINAL floats and query - cosine is preserved).
+            rot.rotate(q, qrot.data());
+            edgevector::quantize(qrot.data(), kDim, qbits);
+            found = itq_graph.search(qbits, kK, ef, hres.data());
+            for (std::uint32_t i = 0; i < found; ++i) got_ids[i] = hres[i].id;
+            hits[1] += overlap10(got_ids, found, truth);
+            found = itq_graph.search_reranked(qbits, qrot.data(), kK, ef,
+                                              sres.data());
+            for (std::uint32_t i = 0; i < found; ++i) got_ids[i] = sres[i].id;
+            hits[3] += overlap10(got_ids, found, truth);
+            found = itq_graph.search_exact_reranked(qbits, q, floats.data(),
+                                                    kDim, kK, ef, sres.data());
+            for (std::uint32_t i = 0; i < found; ++i) got_ids[i] = sres[i].id;
+            hits[5] += overlap10(got_ids, found, truth);
+        }
+        const double denom = static_cast<double>(n_queries * kK);
+        std::printf("| %u | %.3f | **%.3f** | %.3f | **%.3f** | %.3f | **%.3f** |\n",
+                    ef,
+                    static_cast<double>(hits[0]) / denom,
+                    static_cast<double>(hits[1]) / denom,
+                    static_cast<double>(hits[2]) / denom,
+                    static_cast<double>(hits[3]) / denom,
+                    static_cast<double>(hits[4]) / denom,
+                    static_cast<double>(hits[5]) / denom);
+        std::fflush(stdout);
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+}
+
 } // namespace
 
-// Optional argv[1]: "clustered" or "random" runs just that scenario, so each
-// half fits inside a CI/automation time budget; no argument runs both.
+// Optional argv[1]: "clustered", "random", or "itq" runs just that scenario,
+// so each fits inside a CI/automation time budget; no argument runs all.
 int main(int argc, char** argv) {
     const bool want_clustered =
         (argc < 2) || (std::strcmp(argv[1], "clustered") == 0);
     const bool want_random =
         (argc < 2) || (std::strcmp(argv[1], "random") == 0);
+    const bool want_itq =
+        (argc < 2) || (std::strcmp(argv[1], "itq") == 0);
 
     std::printf("# EdgeVector benchmark\n\n");
     std::printf("N = %zu vectors, dim = %zu (%zu quantized bytes each), "
@@ -350,6 +529,9 @@ int main(int argc, char** argv) {
     if (want_random) {
         run_scenario("iid random (adversarial worst case for any ANN index)",
                      false, false);
+    }
+    if (want_itq) {
+        run_itq_scenario();
     }
 
     std::printf("Done.\n");

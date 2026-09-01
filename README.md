@@ -18,8 +18,13 @@ zero dependencies — with a two-stage retrieval pipeline that reaches
   allow-bitmaps, composable, persisted in the graph file
 - **~0.05 s startup at 100k vectors** — mmap the codes, load the prebuilt
   graph (~1,400x faster than rebuilding)
-- **Validated on Linux (POSIX mmap) and Windows (MinGW-w64)**, debug and
-  `-DNDEBUG` release, always under `-O3 -march=native -Wall -Wextra -Werror`
+- **Learned ITQ rotation** for anisotropic (real-embedding-shaped) data:
+  +21 recall points at the same beam width, or the same accuracy at a
+  fraction of the compute — while preserving cosine exactly
+- **Validated on Linux (POSIX mmap), Windows (MinGW-w64), and AArch64**
+  (all suites pass under QEMU emulation with native arm64 g++; the Hamming
+  kernel compiles to NEON `cnt`), debug and `-DNDEBUG` release, always under
+  `-O3 -Wall -Wextra -Werror`
 
 ## The accuracy architecture
 
@@ -93,6 +98,35 @@ re-ranking ladder still triples the float-truth recall at every beam width.
 Real embedding data behaves like the clustered scenario. Both tables ship in
 the benchmark so you can judge for yourself.
 
+### ITQ rotation: better bits for anisotropic data
+
+Sign quantization spends exactly one bit per dimension, but real embedding
+spectra decay — most of the energy lives in a few directions, so most bits
+measure noise. `itq_rotation.hpp` implements **Iterative Quantization**
+(Gong & Lazebnik, 2011): a learned orthogonal rotation that spreads variance
+evenly across dimensions before quantizing. Deliberately rotation-only — no
+centering, no PCA — so **cosine similarity is preserved exactly**: float32
+ground truth is unchanged, and `search_exact_reranked()` can re-rank with the
+*original* floats and query even over a rotated index.
+
+Measured at 50k × 512-d vectors with an `exp(-4d/512)` decaying spectrum
+(recall@10 vs float32 truth; rotation trained on a 5k subsample in 21 s,
+orthogonality residual 1.2e-8):
+
+| ef | raw Hamming | **ITQ Hamming** | raw asym | **ITQ asym** | raw exact | **ITQ exact** |
+|---|---|---|---|---|---|---|
+| 25 | 0.290 | **0.500** | 0.389 | **0.569** | 0.619 | **0.846** |
+| 100 | 0.290 | **0.500** | 0.418 | **0.570** | 1.000 | **1.000** |
+
+Two readings: at fixed ef the codes get much better (+21 points on Hamming
+ranking); at fixed accuracy the exact-re-rank pipeline needs a far narrower
+beam (0.846 at ef = 25 vs 0.619 without). Training is deterministic for a
+fixed seed — bit-identical matrices, verified across x86-64 and AArch64 —
+and the polar-decomposition solver (inverse-free Newton–Schulz, double
+precision, spectrally pre-scaled) reports failure rather than silently
+degrading. The `EVRT` rotation file format validates magic, version,
+dimension, exact length, finiteness, and orthogonality on load.
+
 ## Quick start
 
 Everything is three `#include`s; no linking, no build step for the library
@@ -151,6 +185,16 @@ graph.restore(42);                         //   still routes; persisted (v2)
 std::vector<std::uint64_t> allow((n + 63) / 64, 0);
 // ... set one bit per permitted id ...
 graph.search(ctx, q, 10, 50, by_hamming, allow.data());
+
+// ---- Optional: ITQ rotation for anisotropic embedding data --------------
+#include "edgevector/itq_rotation.hpp"
+ItqRotation rot(dim);
+rot.train(corpus_floats, n, dim);          // offline; deterministic per seed
+rot.save("rotation.evrt");                 // ship next to the index files
+// Index build: quantize rotated vectors; query: rotate first, then quantize.
+std::vector<float> tmp(dim);
+rot.rotate_quantize(query_floats, tmp.data(), q);
+// exact re-rank still takes the ORIGINAL floats: rotation preserves cosine.
 ```
 
 ## Architecture
@@ -160,6 +204,7 @@ graph.search(ctx, q, 10, 50, by_hamming, allow.data());
 | `quantize_math.hpp` | float32 → 1 bit/component sign quantization; Hamming distance over `uint64_t` words via `__builtin_popcountll`; SimHash cosine estimator; **asymmetric ADC scorer** (per-byte lookup tables for `dot(q_float, sign(x))`) |
 | `mmap_storage.hpp` | Validated on-disk vector format (`EVEC` v1) and a zero-copy, read-only `mmap` reader. POSIX primary; Win32 shim confined to `detail::` for development |
 | `hnsw_graph.hpp` | HNSW (Malkov & Yashunin) over the quantized block: build with heuristic neighbor selection + keep-pruned backfill; three zero-allocation search modes; per-thread `SearchContext`s; soft-delete tombstones and allow-bitmap filtering; validated graph persistence (`EVHG` v2, loads v1) |
+| `itq_rotation.hpp` | Learned ITQ rotation (rotation-only, cosine-preserving): double-precision training with an inverse-free Newton–Schulz Procrustes solver; allocation-free `rotate()`/`rotate_quantize()`; validated `EVRT` persistence |
 
 Engineering rules the code holds itself to (and tests enforce):
 
@@ -188,10 +233,10 @@ supported). Linux, WSL, or MinGW-w64 on Windows.
 
 ```sh
 cd tests
-make run          # 4 test suites, asserts enabled
+make run          # 5 test suites, asserts enabled
 make run-release  # same suites under -DNDEBUG
-make bench        # the 100k benchmark reported above (-DNDEBUG; pass a
-                  # scenario to the binary: ./benchmark_100k clustered|random)
+make bench        # the benchmarks reported above (-DNDEBUG; pass a scenario
+                  # to the binary: ./benchmark_100k clustered|random|itq)
 ```
 
 The suites cover: quantization bit-exactness and padding hygiene, cosine
@@ -200,19 +245,29 @@ round-trips and header-corruption rejection, mapped record alignment, HNSW
 recall gates at two scales, result ordering, the re-ranking accuracy ladder
 against float32 ground truth, graph persistence round-trips (bitwise-identical
 results and surviving tombstones after reload), context isolation plus a
-4-thread concurrency test, delete/restore/filter composition, and the
-zero-allocation proof for all three search modes.
+4-thread concurrency test, delete/restore/filter composition, ITQ invariants
+(orthogonality, exact cosine preservation, monotone objective, determinism,
+hostile-file rejection, end-to-end recall gain), and the zero-allocation
+proof for all three search modes.
+
+**AArch64:** `tests/arm64.Dockerfile` reproduces the ARM validation — all
+five suites compiled by native arm64 g++ 13 at `-march=armv8-a -Werror` and
+executed under QEMU user-mode emulation, with the Hamming kernel confirmed to
+compile to NEON `cnt` (vector popcount) instructions. Emulated timings are
+meaningless, so ARM *performance* claims wait for real silicon; correctness —
+including bit-identical ITQ training results vs x86-64 — is validated.
 
 ## Status and roadmap
 
-v0.3. Known limitations, in priority order:
+v0.4. Known limitations, in priority order:
 
 1. **Insert-only capacity** — soft delete exists, but slots are never
    reclaimed and capacity is fixed at construction
 2. **Highly selective filters degrade** toward a scan of the reachable graph
    (true of every filtered-HNSW implementation; documented, not hidden)
-3. **x86-validated only** — the target niche is ARM edge devices, but ARM
-   builds (NEON popcount) have not been exercised yet
+3. **ARM validated for correctness, not yet for performance** — all suites
+   pass on aarch64 under QEMU emulation with NEON popcount codegen confirmed,
+   but latency/QPS numbers on real ARM silicon are still pending
 4. Build is single-threaded (queries are not)
 
 If you need a mature production system in this space today, look at
