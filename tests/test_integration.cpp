@@ -29,6 +29,13 @@
 // path stays allocation-free when reading vectors straight out of the mapping.
 static std::size_t g_new_calls = 0;
 
+// See test_hnsw_graph.cpp: GCC 13+'s -Wmismatched-new-delete misfires on the
+// canonical malloc/free allocator replacement; silenced for the shim only.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
 void* operator new(std::size_t n) {
     ++g_new_calls;
     void* p = std::malloc(n == 0u ? 1u : n);
@@ -42,6 +49,9 @@ void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 namespace {
 

@@ -341,6 +341,56 @@ void test_ranking_preservation() {
     check(overlap >= 9u, "top-10 sets overlap in at least 9 of 10");
 }
 
+// ---------------------------------------------------------------------------
+// Case 6: asymmetric (query-side) scoring — the ADC table must reproduce
+// dot(q, sign(x)) exactly (up to float summation order), including at a
+// dimension with tail padding.
+// ---------------------------------------------------------------------------
+void test_asymmetric_scoring(std::size_t dim) {
+    std::printf("[6] Asymmetric ADC scoring (dim = %zu)\n", dim);
+
+    std::mt19937 rng(42);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+
+    std::vector<float> q(dim);
+    std::vector<float> x(dim);
+    for (std::size_t i = 0; i < dim; ++i) {
+        q[i] = dist(rng);
+    }
+
+    std::vector<float> table(edgevector::asymmetric_table_floats(dim));
+    edgevector::build_asymmetric_table(q.data(), dim, table.data());
+
+    QuantizedBuffer qx(dim);
+    double worst = 0.0;
+    for (int t = 0; t < 50; ++t) {
+        for (std::size_t i = 0; i < dim; ++i) {
+            x[i] = dist(rng);
+        }
+        edgevector::quantize(x.data(), dim, qx.data());
+
+        // Naive reference: +q[i] where the sign bit is 1, -q[i] where it is 0.
+        double naive = 0.0;
+        for (std::size_t i = 0; i < dim; ++i) {
+            naive += (x[i] > 0.0f) ? static_cast<double>(q[i])
+                                   : -static_cast<double>(q[i]);
+        }
+
+        const double table_score = static_cast<double>(
+            edgevector::asymmetric_score(table.data(), qx.data(), dim));
+        const double err = std::fabs(table_score - naive);
+        if (err > worst) {
+            worst = err;
+        }
+    }
+
+    char name[128];
+    std::snprintf(name, sizeof(name),
+                  "dim %zu: table score == dot(q, sign(x)) "
+                  "(worst |err| = %.2e, gate < 1e-3)", dim, worst);
+    check(worst < 1e-3, name);
+}
+
 } // namespace
 
 int main() {
@@ -352,6 +402,8 @@ int main() {
     test_hamming_ground_truth(100);
     test_cosine_parity();
     test_ranking_preservation();
+    test_asymmetric_scoring(512);
+    test_asymmetric_scoring(100);
 
     std::printf("\n=== %s ===\n",
                 (g_failures == 0) ? "ALL CASES PASSED" : "FAILURES DETECTED");

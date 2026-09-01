@@ -135,6 +135,71 @@ inline float cosine_similarity_f32(const float* a, const float* b, std::size_t d
     return dot / denom;
 }
 
+// ============================================================================
+// ASYMMETRIC (query-side) SCORING
+//
+// Hamming distance throws away the query's magnitudes: both sides are +-1.
+// When the full-precision float query is still in hand at search time - it
+// always is - a much sharper estimate costs no extra index memory:
+//
+//     score(x) = dot(q_float, sign(x)),  sign(x) in {-1,+1}^dim
+//
+// computed ADC-style: one 256-entry table of partial sums per code byte,
+// built once per query in O(padded_bytes * 256) adds, then each candidate is
+// scored with padded_bytes table lookups (64 for dim = 512). This resolves
+// the massive integer ties of Hamming ranking with float-grade resolution and
+// is the re-ranking stage of HNSWGraph::search_reranked.
+//
+// Padding is inert by construction: padding components contribute q = 0 to
+// their table entries, so the stored padding bits cannot affect the score.
+// ============================================================================
+
+// Number of floats a caller must allocate for one query's score table.
+constexpr std::size_t asymmetric_table_floats(std::size_t dim) noexcept {
+    return padded_bytes(dim) * 256u;
+}
+
+// Fills `table` (asymmetric_table_floats(dim) floats) for query `q`.
+// table[b * 256 + v] = sum over the 8 components of code byte b, adding
+// +q[j] where byte value v has the bit set and -q[j] where it does not.
+// Built with a subset-sum recurrence: each entry is one add away from the
+// entry with its lowest set bit cleared. No allocation.
+inline void build_asymmetric_table(const float* q, std::size_t dim,
+                                   float* table) noexcept {
+    const std::size_t nbytes = padded_bytes(dim);
+    for (std::size_t b = 0; b < nbytes; ++b) {
+        float qv[8];
+        float all_negative = 0.0f;
+        for (std::size_t i = 0; i < 8u; ++i) {
+            const std::size_t j = b * 8u + i;
+            qv[i] = (j < dim) ? q[j] : 0.0f;
+            all_negative -= qv[i];
+        }
+
+        float* t = table + b * 256u;
+        t[0] = all_negative;
+        for (std::uint32_t v = 1u; v < 256u; ++v) {
+            const std::uint32_t low = v & (0u - v);
+            const std::uint32_t bit =
+                static_cast<std::uint32_t>(__builtin_ctz(low));
+            t[v] = t[v ^ low] + 2.0f * qv[bit];
+        }
+    }
+}
+
+// Scores one quantized vector against a table built by
+// build_asymmetric_table. Higher is more similar. Zero allocation; on the
+// re-ranking path of search_reranked.
+inline float asymmetric_score(const float* table, const std::uint8_t* x,
+                              std::size_t dim) noexcept {
+    const std::size_t nbytes = padded_bytes(dim);
+    float score = 0.0f;
+    for (std::size_t b = 0; b < nbytes; ++b) {
+        score += table[b * 256u + static_cast<std::size_t>(x[b])];
+    }
+    return score;
+}
+
 } // namespace edgevector
 
 #endif // EDGEVECTOR_QUANTIZE_MATH_HPP

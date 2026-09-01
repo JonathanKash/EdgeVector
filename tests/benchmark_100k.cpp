@@ -17,6 +17,15 @@
 //     ~= 4% at 512 bits) and graph navigation loses its gradient. Recall is
 //     low here BY THE NATURE OF THE DATA, not by a defect; it is included so
 //     nobody mistakes the clustered numbers for a universal promise.
+//
+// TWO ACCURACY METRICS per sweep row:
+//
+//  - recall vs the BINARY ground truth (exact Hamming top-10): measures the
+//    graph in isolation.
+//  - recall vs the FLOAT32 ground truth (exact cosine top-10 on the original
+//    floats): the end-to-end number an application actually experiences —
+//    reported for plain Hamming ranking and for search_reranked(), whose
+//    asymmetric dot(q_float, sign(x)) re-ranking is the accuracy feature.
 // ============================================================================
 
 #include "edgevector/hnsw_graph.hpp"
@@ -24,9 +33,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <random>
 #include <utility>
 #include <vector>
@@ -49,7 +61,6 @@ class RecordBlock {
 public:
     RecordBlock(std::size_t dim, std::size_t count)
         : record_bytes_(edgevector::padded_bytes(dim)),
-          count_(count),
           words_((record_bytes_ / 8u) * count, 0u) {}
 
     std::uint8_t* record(std::size_t i) noexcept {
@@ -66,7 +77,6 @@ public:
 
 private:
     std::size_t record_bytes_;
-    std::size_t count_;
     std::vector<std::uint64_t> words_;
 };
 
@@ -102,16 +112,31 @@ struct Sampler {
     }
 };
 
+std::size_t overlap10(const std::uint32_t* got, std::uint32_t n_got,
+                      const std::uint32_t* truth) {
+    std::size_t hits = 0;
+    for (std::uint32_t i = 0; i < n_got; ++i) {
+        for (std::size_t t = 0; t < kK; ++t) {
+            if (got[i] == truth[t]) {
+                ++hits;
+                break;
+            }
+        }
+    }
+    return hits;
+}
+
 void run_scenario(const char* name, bool clustered, bool full_report) {
     std::printf("## Scenario: %s\n\n", name);
 
     Sampler sampler(clustered);
-    std::vector<float> raw(kDim);
 
+    // Dataset: keep the floats (for float32 ground truth) and the codes.
+    std::vector<float> floats(kN * kDim);
     RecordBlock data(kDim, kN);
     for (std::size_t i = 0; i < kN; ++i) {
-        sampler.draw(raw.data());
-        edgevector::quantize(raw.data(), kDim, data.record(i));
+        sampler.draw(floats.data() + i * kDim);
+        edgevector::quantize(floats.data() + i * kDim, kDim, data.record(i));
     }
 
     edgevector::HNSWGraph graph(data.base(), data.record_bytes(), kDim,
@@ -166,18 +191,22 @@ void run_scenario(const char* name, bool clustered, bool full_report) {
     } else {
         std::printf("Build: %.1f s (1 thread).\n\n", build_s);
     }
+    std::fflush(stdout);
 
-    // Queries (same distribution as the data) and exact ground truth.
+    // Queries (same distribution as the data), in both representations.
+    std::vector<float> qfloats(kQueries * kDim);
     std::vector<std::uint64_t> qwords(
         (edgevector::padded_bytes(kDim) / 8u) * kQueries, 0u);
     std::uint8_t* qbase = reinterpret_cast<std::uint8_t*>(qwords.data());
     const std::size_t qstride = edgevector::padded_bytes(kDim);
     for (std::size_t qi = 0; qi < kQueries; ++qi) {
-        sampler.draw(raw.data());
-        edgevector::quantize(raw.data(), kDim, qbase + qi * qstride);
+        sampler.draw(qfloats.data() + qi * kDim);
+        edgevector::quantize(qfloats.data() + qi * kDim, kDim,
+                             qbase + qi * qstride);
     }
 
-    std::vector<std::uint32_t> truth(kQueries * kK);
+    // Exact binary (Hamming) ground truth.
+    std::vector<std::uint32_t> bin_truth(kQueries * kK);
     t0 = Clock::now();
     {
         std::vector<std::pair<std::uint32_t, std::uint32_t>> all(kN);
@@ -190,58 +219,138 @@ void run_scenario(const char* name, bool clustered, bool full_report) {
             }
             std::partial_sort(all.begin(), all.begin() + kK, all.end());
             for (std::size_t i = 0; i < kK; ++i) {
-                truth[qi * kK + i] = all[i].second;
+                bin_truth[qi * kK + i] = all[i].second;
             }
         }
     }
     const double brute_s = seconds_since(t0);
     const double brute_qps = static_cast<double>(kQueries) / brute_s;
-    std::printf("Exact brute-force baseline: %.2f ms/query (%.0f QPS).\n\n",
+
+    // Exact float32 cosine ground truth (rank by dot / ||x||; ||q|| is a
+    // per-query constant that cannot change the order).
+    std::vector<std::uint32_t> f32_truth(kQueries * kK);
+    {
+        std::vector<float> inv_norm(kN);
+        for (std::size_t i = 0; i < kN; ++i) {
+            double s = 0.0;
+            const float* x = floats.data() + i * kDim;
+            for (std::size_t d = 0; d < kDim; ++d) {
+                s += static_cast<double>(x[d]) * static_cast<double>(x[d]);
+            }
+            inv_norm[i] =
+                (s > 0.0) ? static_cast<float>(1.0 / std::sqrt(s)) : 0.0f;
+        }
+        std::vector<std::pair<float, std::uint32_t>> all(kN);
+        for (std::size_t qi = 0; qi < kQueries; ++qi) {
+            const float* q = qfloats.data() + qi * kDim;
+            for (std::size_t i = 0; i < kN; ++i) {
+                const float* x = floats.data() + i * kDim;
+                float dot = 0.0f;
+                for (std::size_t d = 0; d < kDim; ++d) {
+                    dot += q[d] * x[d];
+                }
+                all[i] = std::make_pair(-dot * inv_norm[i],
+                                        static_cast<std::uint32_t>(i));
+            }
+            std::partial_sort(all.begin(), all.begin() + kK, all.end());
+            for (std::size_t i = 0; i < kK; ++i) {
+                f32_truth[qi * kK + i] = all[i].second;
+            }
+        }
+    }
+
+    std::printf("Exact binary scan baseline: %.2f ms/query (%.0f QPS).\n\n",
                 1000.0 * brute_s / static_cast<double>(kQueries), brute_qps);
 
-    std::printf("| ef | recall@10 | mean latency | QPS (1 thread) | vs exact |\n");
-    std::printf("|---|---|---|---|---|\n");
+    std::printf("| ef | recall@10 (binary GT) | float GT, Hamming rank | float GT, asym re-rank | float GT, **exact re-rank** | lat Hamming | lat asym | lat exact |\n");
+    std::printf("|---|---|---|---|---|---|---|---|\n");
     const std::uint32_t ef_sweep[] = {10u, 25u, 50u, 100u, 200u};
     std::vector<edgevector::SearchResult> results(kK);
+    std::vector<edgevector::ScoredResult> scored(kK);
+    std::uint32_t got_ids[kK];
+
     for (const std::uint32_t ef : ef_sweep) {
-        std::size_t hits = 0;
+        std::size_t bin_hits = 0;
+        std::size_t f32_plain_hits = 0;
+        std::size_t f32_rerank_hits = 0;
+        std::size_t f32_exact_hits = 0;
+
         t0 = Clock::now();
         for (std::size_t qi = 0; qi < kQueries; ++qi) {
             const std::uint32_t found = graph.search(
                 qbase + qi * qstride, kK, ef, results.data());
             for (std::uint32_t i = 0; i < found; ++i) {
-                for (std::size_t t = 0; t < kK; ++t) {
-                    if (results[i].id == truth[qi * kK + t]) {
-                        ++hits;
-                        break;
-                    }
-                }
+                got_ids[i] = results[i].id;
             }
+            bin_hits += overlap10(got_ids, found, &bin_truth[qi * kK]);
+            f32_plain_hits += overlap10(got_ids, found, &f32_truth[qi * kK]);
         }
-        const double sweep_s = seconds_since(t0);
-        const double recall = static_cast<double>(hits) /
-                              static_cast<double>(kQueries * kK);
-        const double qps = static_cast<double>(kQueries) / sweep_s;
-        std::printf("| %u | %.3f | %.0f us | %.0f | %.1fx |\n",
-                    ef, recall,
-                    1.0e6 * sweep_s / static_cast<double>(kQueries), qps,
-                    qps / brute_qps);
+        const double plain_s = seconds_since(t0);
+
+        t0 = Clock::now();
+        for (std::size_t qi = 0; qi < kQueries; ++qi) {
+            const std::uint32_t found = graph.search_reranked(
+                qbase + qi * qstride, qfloats.data() + qi * kDim, kK, ef,
+                scored.data());
+            for (std::uint32_t i = 0; i < found; ++i) {
+                got_ids[i] = scored[i].id;
+            }
+            f32_rerank_hits += overlap10(got_ids, found, &f32_truth[qi * kK]);
+        }
+        const double rerank_s = seconds_since(t0);
+
+        t0 = Clock::now();
+        for (std::size_t qi = 0; qi < kQueries; ++qi) {
+            const std::uint32_t found = graph.search_exact_reranked(
+                qbase + qi * qstride, qfloats.data() + qi * kDim,
+                floats.data(), kDim, kK, ef, scored.data());
+            for (std::uint32_t i = 0; i < found; ++i) {
+                got_ids[i] = scored[i].id;
+            }
+            f32_exact_hits += overlap10(got_ids, found, &f32_truth[qi * kK]);
+        }
+        const double exact_s = seconds_since(t0);
+
+        const double denom = static_cast<double>(kQueries * kK);
+        std::printf("| %u | %.3f | %.3f | %.3f | **%.3f** | %.0f us | %.0f us | %.0f us |\n",
+                    ef,
+                    static_cast<double>(bin_hits) / denom,
+                    static_cast<double>(f32_plain_hits) / denom,
+                    static_cast<double>(f32_rerank_hits) / denom,
+                    static_cast<double>(f32_exact_hits) / denom,
+                    1.0e6 * plain_s / static_cast<double>(kQueries),
+                    1.0e6 * rerank_s / static_cast<double>(kQueries),
+                    1.0e6 * exact_s / static_cast<double>(kQueries));
+        std::fflush(stdout); // survive being killed mid-run when redirected
     }
     std::printf("\n");
+    std::fflush(stdout);
 }
 
 } // namespace
 
-int main() {
+// Optional argv[1]: "clustered" or "random" runs just that scenario, so each
+// half fits inside a CI/automation time budget; no argument runs both.
+int main(int argc, char** argv) {
+    const bool want_clustered =
+        (argc < 2) || (std::strcmp(argv[1], "clustered") == 0);
+    const bool want_random =
+        (argc < 2) || (std::strcmp(argv[1], "random") == 0);
+
     std::printf("# EdgeVector benchmark\n\n");
     std::printf("N = %zu vectors, dim = %zu (%zu quantized bytes each), "
                 "M = 16, ef_construction = 200, k = %u, %zu queries, "
                 "single thread.\n\n",
                 kN, kDim, edgevector::padded_bytes(kDim), kK, kQueries);
+    std::fflush(stdout);
 
-    run_scenario("clustered (embedding-like, 1000 clusters)", true, true);
-    run_scenario("iid random (adversarial worst case for any ANN index)",
-                 false, false);
+    if (want_clustered) {
+        run_scenario("clustered (embedding-like, 1000 clusters)", true, true);
+    }
+    if (want_random) {
+        run_scenario("iid random (adversarial worst case for any ANN index)",
+                     false, false);
+    }
 
     std::printf("Done.\n");
     return 0;

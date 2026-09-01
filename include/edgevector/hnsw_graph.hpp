@@ -5,7 +5,8 @@
 // EdgeVector :: hnsw_graph.hpp
 //
 // Hierarchical Navigable Small World graph (Malkov & Yashunin, 2016) over
-// binary-quantized vectors, using the Hamming kernel from quantize_math.hpp.
+// binary-quantized vectors, using the Hamming kernel and the asymmetric
+// (query-side) scorer from quantize_math.hpp.
 //
 // MEMORY MODEL
 // ------------
@@ -20,26 +21,52 @@
 // node participates in. Node levels are drawn from the standard geometric
 // distribution with mL = 1 / ln(M), capped at 31.
 //
+// SEARCH MODES
+// ------------
+//   search()          - k-NN by Hamming distance.
+//   search_reranked() - retrieves an ef-wide candidate pool by Hamming, then
+//                       re-ranks it with the asymmetric score
+//                       dot(q_float, sign(x)) - float-grade resolution over
+//                       Hamming's coarse integer ties, at zero extra index
+//                       memory. Requires the float query alongside the
+//                       quantized one.
+// Both accept an optional caller-owned allow-bitmap (bit id set = id may be
+// returned) and always exclude soft-deleted nodes; filtered-out nodes still
+// route traversal. NOTE: a highly selective filter degrades toward a scan of
+// the reachable graph, as in every filtered-HNSW implementation.
+//
+// DELETION
+// --------
+// remove(id) soft-deletes: the node stays in the graph as a routing waypoint
+// (links intact) but is never returned by queries. restore(id) undoes it.
+// Tombstones persist in the graph file (format v2).
+//
 // ZERO-ALLOCATION QUERY PATH (CLAUDE.md section 3)
 // ------------------------------------------------
-// All query-time working memory is pre-allocated at construction:
-//   - a visited-epoch array (O(1) reset by bumping an epoch counter; the
-//     array is memset only on 32-bit epoch wraparound, which is not an
-//     allocation),
+// All query-time working memory lives in a SearchContext, pre-allocated when
+// the context is created:
+//   - a visited-epoch array (O(1) reset by bumping an epoch counter; memset
+//     only on 32-bit wraparound, which is not an allocation),
 //   - a fixed-capacity candidate min-heap sized capacity+1 (each node enters
 //     it at most once per search, so it cannot overflow),
-//   - a fixed-capacity result max-heap sized ef_limit+1.
-// search() and everything it calls perform no heap allocation, no
-// std::vector::push_back, and no system calls; heaps are raw arrays driven
-// by std::push_heap/std::pop_heap with explicit size counters. insert() is
-// the build path, where allocation is permitted (per-node link arrays are
-// sized exactly once, at insertion).
+//   - a fixed-capacity result max-heap sized ef_limit+1,
+//   - the asymmetric score table and a scored-candidate buffer for
+//     search_reranked.
+// search() / search_reranked() and everything they call perform no heap
+// allocation, no std::vector::push_back, and no system calls; heaps are raw
+// arrays driven by std::push_heap/std::pop_heap with explicit size counters.
+// insert() is the build path, where allocation is permitted.
 //
-// Ties are broken by (distance, id) everywhere, so results are deterministic
-// and comparable against a brute-force baseline using the same ordering.
+// THREADING
+// ---------
+// Queries are thread-safe when each thread uses its own SearchContext
+// (graph.make_context()) against a graph that is not being mutated. The
+// no-context convenience overloads use an internal default context and are
+// single-threaded. insert()/remove()/restore()/load_graph() must not run
+// concurrently with anything else.
 //
-// THREADING: not thread-safe. The scratch pools are owned by the graph, so
-// one graph instance supports one query at a time.
+// Ties break by (distance, id) everywhere, so results are deterministic and
+// comparable against a brute-force baseline using the same ordering.
 // ============================================================================
 
 #include <algorithm>
@@ -59,7 +86,12 @@ namespace edgevector {
 
 struct SearchResult {
     std::uint32_t id;
-    std::uint32_t distance;
+    std::uint32_t distance; // Hamming
+};
+
+struct ScoredResult {
+    std::uint32_t id;
+    float score; // dot(q_float, sign(x)); higher = more similar
 };
 
 // Status of save_graph()/load_graph(). Like the storage module, graph I/O
@@ -81,10 +113,21 @@ struct Candidate {
     std::uint32_t id;
 };
 
+struct Scored {
+    float score;
+    std::uint32_t id;
+};
+
 // Total order: ascending by distance, then by id. Using it on both the graph
 // and the brute-force baseline makes tie handling deterministic.
 inline bool candidate_less(const Candidate& a, const Candidate& b) noexcept {
     return (a.dist != b.dist) ? (a.dist < b.dist) : (a.id < b.id);
+}
+
+// Descending by score, then ascending by id: the output order of
+// search_reranked.
+inline bool scored_better(const Scored& a, const Scored& b) noexcept {
+    return (a.score != b.score) ? (a.score > b.score) : (a.id < b.id);
 }
 
 struct MinHeapCmp {
@@ -141,11 +184,66 @@ private:
 
 } // namespace detail
 
+class HNSWGraph;
+
+// Pre-allocated per-thread query scratch. Create one per querying thread via
+// HNSWGraph::make_context() (which allocates); every search through it is
+// then allocation-free. Movable, not copyable.
+class SearchContext {
+public:
+    SearchContext(SearchContext&&) noexcept = default;
+    SearchContext& operator=(SearchContext&&) noexcept = default;
+    SearchContext(const SearchContext&) = delete;
+    SearchContext& operator=(const SearchContext&) = delete;
+
+private:
+    friend class HNSWGraph;
+
+    SearchContext(std::uint32_t capacity, std::uint32_t ef_limit,
+                  std::size_t table_floats)
+        : capacity_(capacity) {
+        visited_.reset(new std::uint32_t[capacity]);
+        std::memset(visited_.get(), 0,
+                    static_cast<std::size_t>(capacity) * 4u);
+        cand_buf_.reset(
+            new detail::Candidate[static_cast<std::size_t>(capacity) + 1u]);
+        res_buf_.reset(
+            new detail::Candidate[static_cast<std::size_t>(ef_limit) + 1u]);
+        scored_buf_.reset(
+            new detail::Scored[static_cast<std::size_t>(ef_limit) + 1u]);
+        asym_table_.reset(new float[table_floats]);
+        cand_heap_.init(cand_buf_.get(), capacity + 1u);
+        res_heap_.init(res_buf_.get(), ef_limit + 1u);
+    }
+
+    void next_epoch() noexcept {
+        ++epoch_;
+        if (epoch_ == 0u) { // 32-bit wrap: hard reset, then restart at 1
+            std::memset(visited_.get(), 0,
+                        static_cast<std::size_t>(capacity_) * 4u);
+            epoch_ = 1u;
+        }
+    }
+    bool is_visited(std::uint32_t id) const noexcept {
+        return visited_[id] == epoch_;
+    }
+    void mark_visited(std::uint32_t id) noexcept { visited_[id] = epoch_; }
+
+    std::uint32_t capacity_ = 0u;
+    std::unique_ptr<std::uint32_t[]> visited_;
+    std::uint32_t epoch_ = 0u;
+    std::unique_ptr<detail::Candidate[]> cand_buf_;
+    std::unique_ptr<detail::Candidate[]> res_buf_;
+    std::unique_ptr<detail::Scored[]> scored_buf_;
+    std::unique_ptr<float[]> asym_table_;
+    detail::FixedHeap<detail::MinHeapCmp> cand_heap_;
+    detail::FixedHeap<detail::MaxHeapCmp> res_heap_;
+};
+
 class HNSWGraph {
 public:
     // `vectors`: base of the contiguous quantized block (external, outlives
     // the graph). `record_bytes` >= padded_bytes(dim), 8-byte aligned records.
-    // Scratch pools and link tables are sized here; capacity is final.
     HNSWGraph(const std::uint8_t* vectors,
               std::size_t record_bytes,
               std::size_t dim,
@@ -174,35 +272,40 @@ public:
         levels_.reset(new std::uint8_t[capacity_]);
         std::memset(levels_.get(), 0xFF, capacity_); // kNotInserted
 
-        visited_.reset(new std::uint32_t[capacity_]);
-        std::memset(visited_.get(), 0, static_cast<std::size_t>(capacity_) * 4u);
+        deleted_words_ = (static_cast<std::size_t>(capacity_) + 63u) / 64u;
+        deleted_.reset(new std::uint64_t[deleted_words_]);
+        std::memset(deleted_.get(), 0, deleted_words_ * 8u);
 
-        // Candidate heap bound: every node is pushed at most once per search
-        // (guarded by the visited set), so capacity+1 can never overflow.
-        cand_buf_.reset(new detail::Candidate[static_cast<std::size_t>(capacity_) + 1u]);
-        res_buf_.reset(new detail::Candidate[static_cast<std::size_t>(ef_limit_) + 1u]);
         select_buf_.reset(new detail::Candidate[static_cast<std::size_t>(ef_limit_) +
                                                 static_cast<std::size_t>(m0_) + 2u]);
         selected_.reset(new std::uint32_t[static_cast<std::size_t>(m0_) + 1u]);
 
-        cand_heap_.init(cand_buf_.get(), capacity_ + 1u);
-        res_heap_.init(res_buf_.get(), ef_limit_ + 1u);
-
         links_.resize(capacity_);
         counts_.resize(capacity_);
+
+        default_ctx_.reset(new SearchContext(make_context()));
     }
 
     HNSWGraph(const HNSWGraph&) = delete;
     HNSWGraph& operator=(const HNSWGraph&) = delete;
 
     std::uint32_t size() const noexcept { return size_; }
+    std::uint32_t deleted_count() const noexcept { return deleted_count_; }
+    std::uint32_t live_size() const noexcept { return size_ - deleted_count_; }
     std::uint32_t capacity() const noexcept { return capacity_; }
     std::size_t dim() const noexcept { return dim_; }
     std::uint32_t max_ef() const noexcept { return ef_limit_; }
 
+    // Allocates a fresh scratch context sized for this graph. Do this once
+    // per querying thread, at setup time - never per query.
+    SearchContext make_context() const {
+        return SearchContext(capacity_, ef_limit_,
+                             asymmetric_table_floats(dim_));
+    }
+
     // BUILD PATH (allocation permitted). Inserts the vector at index `id` of
     // the external block. Each id may be inserted once; returns false for an
-    // out-of-range or duplicate id.
+    // out-of-range or duplicate id. Not thread-safe.
     bool insert(std::uint32_t id) {
         if (id >= capacity_ || levels_[id] != kNotInserted) {
             return false;
@@ -223,6 +326,7 @@ public:
             return true;
         }
 
+        SearchContext& ctx = *default_ctx_;
         const std::uint8_t* q = vec(id);
         std::uint32_t ep = entry_;
         std::uint32_t ep_dist = distance_to(q, ep);
@@ -233,10 +337,12 @@ public:
 
         const std::uint32_t top = (entry_level_ < level) ? entry_level_ : level;
         for (std::uint32_t l = top;; --l) {
-            const std::uint32_t found =
-                search_layer(q, ep, ef_construction_, l);
+            // Build ignores tombstones: deleted nodes keep routing, and links
+            // to them stay valid.
+            const std::uint32_t found = search_layer(
+                ctx, q, ep, ef_construction_, l, nullptr, false);
 
-            const detail::Candidate* raw = res_heap_.data();
+            const detail::Candidate* raw = ctx.res_heap_.data();
             for (std::uint32_t i = 0u; i < found; ++i) {
                 select_buf_[i] = raw[i];
             }
@@ -274,48 +380,191 @@ public:
         return true;
     }
 
+    // Soft delete: the node stops appearing in results but keeps routing
+    // traffic. Returns false for an id that is out of range, never inserted,
+    // or already deleted. Not thread-safe against concurrent queries.
+    bool remove(std::uint32_t id) noexcept {
+        if (id >= capacity_ || levels_[id] == kNotInserted || is_deleted(id)) {
+            return false;
+        }
+        deleted_[id >> 6u] |= (1ull << (id & 63u));
+        ++deleted_count_;
+        return true;
+    }
+
+    // Undoes remove(). Returns false unless the id is currently deleted.
+    bool restore(std::uint32_t id) noexcept {
+        if (id >= capacity_ || levels_[id] == kNotInserted || !is_deleted(id)) {
+            return false;
+        }
+        deleted_[id >> 6u] &= ~(1ull << (id & 63u));
+        --deleted_count_;
+        return true;
+    }
+
+    bool is_deleted(std::uint32_t id) const noexcept {
+        return ((deleted_[id >> 6u] >> (id & 63u)) & 1ull) != 0ull;
+    }
+
     // QUERY CRITICAL PATH: zero allocation, no system calls, noexcept.
-    // Writes up to k results into `out`, ascending by (distance, id), and
-    // returns how many were written. `ef` is the layer-0 beam width, clamped
-    // to [k, max_ef()]; k itself is clamped to max_ef().
-    std::uint32_t search(const std::uint8_t* q,
+    // Writes up to k results into `out`, ascending by (Hamming distance, id),
+    // and returns how many were written. `ef` is the layer-0 beam width,
+    // clamped to [k, max_ef()]; k itself is clamped to max_ef().
+    //
+    // `allow`, if given, is a caller-owned bitmap of (capacity+63)/64 words:
+    // only ids whose bit is set may be returned. Soft-deleted ids are always
+    // excluded. Excluded nodes still route.
+    std::uint32_t search(SearchContext& ctx,
+                         const std::uint8_t* q,
                          std::uint32_t k,
                          std::uint32_t ef,
-                         SearchResult* out) noexcept {
+                         SearchResult* out,
+                         const std::uint64_t* allow = nullptr) const noexcept {
         if (!has_entry_ || k == 0u || q == nullptr || out == nullptr) {
             return 0u;
         }
-        if (k > ef_limit_) {
-            k = ef_limit_;
-        }
-        if (ef < k) {
-            ef = k;
-        }
-        if (ef > ef_limit_) {
-            ef = ef_limit_;
-        }
+        clamp_kef(k, ef);
 
-        std::uint32_t ep = entry_;
-        std::uint32_t ep_dist = distance_to(q, ep);
-        for (std::uint32_t l = entry_level_; l > 0u; --l) {
-            greedy_descend(q, l, ep, ep_dist);
-        }
-
-        std::uint32_t found = search_layer(q, ep, ef, 0u);
+        std::uint32_t found = beam_layer0(ctx, q, ef, allow);
         while (found > k) { // keep only the k best
-            res_heap_.pop();
+            ctx.res_heap_.pop();
             --found;
         }
         for (std::uint32_t i = found; i > 0u; --i) { // max-heap pops worst first
-            const detail::Candidate c = res_heap_.top();
-            res_heap_.pop();
+            const detail::Candidate c = ctx.res_heap_.top();
+            ctx.res_heap_.pop();
             out[i - 1u] = SearchResult{c.id, c.dist};
         }
         return found;
     }
 
+    // Convenience overload on the internal default context. Single-threaded.
+    std::uint32_t search(const std::uint8_t* q, std::uint32_t k,
+                         std::uint32_t ef, SearchResult* out) noexcept {
+        return search(*default_ctx_, q, k, ef, out, nullptr);
+    }
+
+    // Two-stage search: retrieve an ef-wide candidate pool by Hamming beam,
+    // then re-rank the whole pool by the asymmetric score
+    // dot(q_floats, sign(x)) and return the k best, descending by (score,
+    // then ascending id). `q_bits` must be quantize(q_floats). Same zero-
+    // allocation guarantee and filtering semantics as search(); the accuracy
+    // gain comes from ranking the pool with float-grade resolution instead of
+    // Hamming's coarse integer ties. Widen ef to widen the re-ranked pool.
+    std::uint32_t search_reranked(SearchContext& ctx,
+                                  const std::uint8_t* q_bits,
+                                  const float* q_floats,
+                                  std::uint32_t k,
+                                  std::uint32_t ef,
+                                  ScoredResult* out,
+                                  const std::uint64_t* allow = nullptr) const noexcept {
+        if (!has_entry_ || k == 0u || q_bits == nullptr ||
+            q_floats == nullptr || out == nullptr) {
+            return 0u;
+        }
+        clamp_kef(k, ef);
+
+        const std::uint32_t found = beam_layer0(ctx, q_bits, ef, allow);
+        if (found == 0u) {
+            return 0u;
+        }
+
+        build_asymmetric_table(q_floats, dim_, ctx.asym_table_.get());
+        const detail::Candidate* raw = ctx.res_heap_.data();
+        for (std::uint32_t i = 0u; i < found; ++i) {
+            ctx.scored_buf_[i] = detail::Scored{
+                asymmetric_score(ctx.asym_table_.get(), vec(raw[i].id), dim_),
+                raw[i].id};
+        }
+
+        const std::uint32_t n_out = (k < found) ? k : found;
+        std::partial_sort(ctx.scored_buf_.get(),
+                          ctx.scored_buf_.get() + n_out,
+                          ctx.scored_buf_.get() + found, detail::scored_better);
+        for (std::uint32_t i = 0u; i < n_out; ++i) {
+            out[i] = ScoredResult{ctx.scored_buf_[i].id,
+                                  ctx.scored_buf_[i].score};
+        }
+        return n_out;
+    }
+
+    // Convenience overload on the internal default context. Single-threaded.
+    std::uint32_t search_reranked(const std::uint8_t* q_bits,
+                                  const float* q_floats, std::uint32_t k,
+                                  std::uint32_t ef, ScoredResult* out) noexcept {
+        return search_reranked(*default_ctx_, q_bits, q_floats, k, ef, out,
+                               nullptr);
+    }
+
+    // Two-stage search with EXACT re-ranking: retrieve an ef-wide candidate
+    // pool by Hamming beam, then score the pool with true float32 cosine
+    // similarity against caller-provided full-precision vectors and return
+    // the k best (descending score, ascending id on ties).
+    //
+    // `vectors_f32` holds the original floats: vector id starts at
+    // vectors_f32 + id * f32_stride (stride in floats, >= dim). The intended
+    // deployment keeps this block on flash via a read-only mmap - RAM then
+    // holds only the 1-bit codes, and each query demand-pages just the ef
+    // candidate vectors (~ef * dim * 4 bytes) it actually touches. This is
+    // the accuracy ceiling of the index: recall against float32 ground truth
+    // is limited only by whether the Hamming pool contains the true
+    // neighbors, not by 1-bit ranking resolution.
+    //
+    // Zero allocation, noexcept; ~2 * ef * dim flops of re-ranking cost.
+    std::uint32_t search_exact_reranked(SearchContext& ctx,
+                                        const std::uint8_t* q_bits,
+                                        const float* q_floats,
+                                        const float* vectors_f32,
+                                        std::size_t f32_stride,
+                                        std::uint32_t k,
+                                        std::uint32_t ef,
+                                        ScoredResult* out,
+                                        const std::uint64_t* allow = nullptr) const noexcept {
+        if (!has_entry_ || k == 0u || q_bits == nullptr ||
+            q_floats == nullptr || vectors_f32 == nullptr ||
+            f32_stride < dim_ || out == nullptr) {
+            return 0u;
+        }
+        clamp_kef(k, ef);
+
+        const std::uint32_t found = beam_layer0(ctx, q_bits, ef, allow);
+        if (found == 0u) {
+            return 0u;
+        }
+
+        const detail::Candidate* raw = ctx.res_heap_.data();
+        for (std::uint32_t i = 0u; i < found; ++i) {
+            const float* x = vectors_f32 +
+                             static_cast<std::size_t>(raw[i].id) * f32_stride;
+            ctx.scored_buf_[i] = detail::Scored{
+                cosine_similarity_f32(q_floats, x, dim_), raw[i].id};
+        }
+
+        const std::uint32_t n_out = (k < found) ? k : found;
+        std::partial_sort(ctx.scored_buf_.get(),
+                          ctx.scored_buf_.get() + n_out,
+                          ctx.scored_buf_.get() + found, detail::scored_better);
+        for (std::uint32_t i = 0u; i < n_out; ++i) {
+            out[i] = ScoredResult{ctx.scored_buf_[i].id,
+                                  ctx.scored_buf_[i].score};
+        }
+        return n_out;
+    }
+
+    // Convenience overload on the internal default context. Single-threaded.
+    std::uint32_t search_exact_reranked(const std::uint8_t* q_bits,
+                                        const float* q_floats,
+                                        const float* vectors_f32,
+                                        std::size_t f32_stride,
+                                        std::uint32_t k, std::uint32_t ef,
+                                        ScoredResult* out) noexcept {
+        return search_exact_reranked(*default_ctx_, q_bits, q_floats,
+                                     vectors_f32, f32_stride, k, ef, out,
+                                     nullptr);
+    }
+
     // ------------------------------------------------------------------------
-    // GRAPH PERSISTENCE (version 1, little-endian, load-time path)
+    // GRAPH PERSISTENCE (little-endian, load-time path)
     //
     // The link structure is saved separately from the vectors: the vector file
     // is owned by mmap_storage.hpp, this file holds only the graph. A saved
@@ -323,7 +572,7 @@ public:
     // over; pair the two files and load them together.
     //
     //   Bytes  0.. 3  char magic[4] = { 'E','V','H','G' }
-    //   Bytes  4.. 7  u32  version  = 1
+    //   Bytes  4.. 7  u32  version  (this writer: 2; version 1 also loads)
     //   Bytes  8..15  u64  dim
     //   Bytes 16..19  u32  capacity
     //   Bytes 20..23  u32  M
@@ -336,10 +585,13 @@ public:
     //     u8 level (0xFF = not inserted; nothing else follows for that id)
     //     u32 counts[level + 1]
     //     u32 slots[M0 + level * M]
+    //   Version 2 only, after the node records:
+    //     u64 deleted_bitmap[(capacity + 63) / 64]   (soft-delete tombstones)
     //
     // load_graph() validates everything it reads (levels, counts, link
-    // targets, entry point, node count, exact file length) and rejects a file
-    // whose dim/capacity/M differ from this graph's construction parameters.
+    // targets, entry point, node count, tombstone integrity, exact file
+    // length) and rejects a file whose dim/capacity/M differ from this
+    // graph's construction parameters.
     // ------------------------------------------------------------------------
 
     GraphIoStatus save_graph(const char* path) const {
@@ -381,6 +633,10 @@ public:
             ok = std::fwrite(counts_[id].data(), 4u, n_counts, f) == n_counts &&
                  std::fwrite(links_[id].data(), 4u, n_slots, f) == n_slots;
         }
+        if (ok) {
+            ok = std::fwrite(deleted_.get(), 8u, deleted_words_, f) ==
+                 deleted_words_;
+        }
 
         if (std::fclose(f) != 0) {
             ok = false;
@@ -410,7 +666,8 @@ public:
     }
 
     // Bytes of pre-allocated + per-node graph memory (links, counts, levels,
-    // visited set, heaps). For footprint reporting; not on any hot path.
+    // tombstones, and the default context's pools). For footprint reporting;
+    // not on any hot path.
     std::size_t graph_memory_bytes() const noexcept {
         std::size_t total = 0u;
         for (std::uint32_t i = 0u; i < capacity_; ++i) {
@@ -418,9 +675,13 @@ public:
             total += counts_[i].capacity() * sizeof(std::uint32_t);
         }
         total += static_cast<std::size_t>(capacity_);       // levels_
-        total += static_cast<std::size_t>(capacity_) * 4u;  // visited_
+        total += deleted_words_ * 8u;                       // tombstones
+        // default context: visited + heaps + rerank scratch
+        total += static_cast<std::size_t>(capacity_) * 4u;
         total += (static_cast<std::size_t>(capacity_) + 1u) * sizeof(detail::Candidate);
-        total += (static_cast<std::size_t>(ef_limit_) + 1u) * sizeof(detail::Candidate);
+        total += (static_cast<std::size_t>(ef_limit_) + 1u) *
+                 (sizeof(detail::Candidate) + sizeof(detail::Scored));
+        total += asymmetric_table_floats(dim_) * sizeof(float);
         return total;
     }
 
@@ -428,135 +689,7 @@ private:
     static constexpr std::uint8_t kNotInserted = 0xFFu;
     static constexpr std::uint32_t kMaxLevel = 31u;
     static constexpr std::size_t kIoHeaderBytes = 64u;
-    static constexpr std::uint32_t kIoVersion = 1u;
-
-    void reset_graph_state() {
-        std::memset(levels_.get(), 0xFF, capacity_);
-        for (std::uint32_t i = 0u; i < capacity_; ++i) {
-            links_[i].clear();
-            links_[i].shrink_to_fit();
-            counts_[i].clear();
-            counts_[i].shrink_to_fit();
-        }
-        has_entry_ = false;
-        entry_ = 0u;
-        entry_level_ = 0u;
-        size_ = 0u;
-    }
-
-    static bool read_exact(std::FILE* f, void* dst, std::size_t n) {
-        return std::fread(dst, 1u, n, f) == n;
-    }
-
-    GraphIoStatus load_graph_body(std::FILE* f) {
-        std::uint8_t header[kIoHeaderBytes];
-        if (!read_exact(f, header, sizeof(header))) {
-            return GraphIoStatus::io_error;
-        }
-        if (header[0] != static_cast<std::uint8_t>('E') ||
-            header[1] != static_cast<std::uint8_t>('V') ||
-            header[2] != static_cast<std::uint8_t>('H') ||
-            header[3] != static_cast<std::uint8_t>('G')) {
-            return GraphIoStatus::bad_magic;
-        }
-        std::uint32_t version = 0u;
-        std::memcpy(&version, header + 4u, 4u);
-        if (version != kIoVersion) {
-            return GraphIoStatus::bad_version;
-        }
-        std::uint64_t dim64 = 0u;
-        std::uint32_t capacity = 0u;
-        std::uint32_t m = 0u;
-        std::uint32_t size = 0u;
-        std::uint32_t entry = 0u;
-        std::uint32_t entry_level = 0u;
-        std::uint8_t has_entry = 0u;
-        std::memcpy(&dim64, header + 8u, 8u);
-        std::memcpy(&capacity, header + 16u, 4u);
-        std::memcpy(&m, header + 20u, 4u);
-        std::memcpy(&size, header + 24u, 4u);
-        std::memcpy(&entry, header + 28u, 4u);
-        std::memcpy(&entry_level, header + 32u, 4u);
-        std::memcpy(&has_entry, header + 36u, 1u);
-
-        if (dim64 != static_cast<std::uint64_t>(dim_) ||
-            capacity != capacity_ || m != m_) {
-            return GraphIoStatus::incompatible;
-        }
-        if (size > capacity_ || has_entry > 1u ||
-            (has_entry == 0u && size > 0u) || entry_level > kMaxLevel ||
-            (has_entry == 1u && entry >= capacity_)) {
-            return GraphIoStatus::corrupt;
-        }
-
-        std::uint32_t loaded = 0u;
-        for (std::uint32_t id = 0u; id < capacity_; ++id) {
-            std::uint8_t lvl = 0u;
-            if (!read_exact(f, &lvl, 1u)) {
-                return GraphIoStatus::io_error;
-            }
-            if (lvl == kNotInserted) {
-                continue;
-            }
-            if (static_cast<std::uint32_t>(lvl) > kMaxLevel) {
-                return GraphIoStatus::corrupt;
-            }
-            counts_[id].assign(static_cast<std::size_t>(lvl) + 1u, 0u);
-            links_[id].assign(static_cast<std::size_t>(m0_) +
-                                  static_cast<std::size_t>(lvl) * m_,
-                              0u);
-            if (!read_exact(f, counts_[id].data(), counts_[id].size() * 4u) ||
-                !read_exact(f, links_[id].data(), links_[id].size() * 4u)) {
-                return GraphIoStatus::io_error;
-            }
-            for (std::uint32_t l = 0u; l <= static_cast<std::uint32_t>(lvl); ++l) {
-                if (counts_[id][l] > max_m(l)) {
-                    return GraphIoStatus::corrupt;
-                }
-            }
-            levels_[id] = lvl;
-            ++loaded;
-        }
-
-        std::uint8_t trailing = 0u;
-        if (loaded != size || std::fread(&trailing, 1u, 1u, f) != 0u) {
-            return GraphIoStatus::corrupt; // node count or file length is off
-        }
-
-        // Referential integrity: every link must point at an inserted node
-        // that actually exists on that layer, and never at itself.
-        for (std::uint32_t id = 0u; id < capacity_; ++id) {
-            if (levels_[id] == kNotInserted) {
-                continue;
-            }
-            const std::uint32_t lvl = static_cast<std::uint32_t>(levels_[id]);
-            for (std::uint32_t l = 0u; l <= lvl; ++l) {
-                const std::size_t offset =
-                    (l == 0u) ? 0u
-                              : static_cast<std::size_t>(m0_) +
-                                    static_cast<std::size_t>(l - 1u) * m_;
-                for (std::uint32_t i = 0u; i < counts_[id][l]; ++i) {
-                    const std::uint32_t t = links_[id][offset + i];
-                    if (t >= capacity_ || t == id ||
-                        levels_[t] == kNotInserted ||
-                        static_cast<std::uint32_t>(levels_[t]) < l) {
-                        return GraphIoStatus::corrupt;
-                    }
-                }
-            }
-        }
-        if (has_entry == 1u &&
-            (levels_[entry] == kNotInserted ||
-             static_cast<std::uint32_t>(levels_[entry]) < entry_level)) {
-            return GraphIoStatus::corrupt;
-        }
-
-        has_entry_ = (has_entry == 1u);
-        entry_ = entry;
-        entry_level_ = entry_level;
-        size_ = size;
-        return GraphIoStatus::ok;
-    }
+    static constexpr std::uint32_t kIoVersion = 2u;
 
     const std::uint8_t* vec(std::uint32_t id) const noexcept {
         return vectors_ + static_cast<std::size_t>(id) * record_bytes_;
@@ -568,6 +701,31 @@ private:
 
     std::uint32_t max_m(std::uint32_t layer) const noexcept {
         return (layer == 0u) ? m0_ : m_;
+    }
+
+    void clamp_kef(std::uint32_t& k, std::uint32_t& ef) const noexcept {
+        if (k > ef_limit_) {
+            k = ef_limit_;
+        }
+        if (ef < k) {
+            ef = k;
+        }
+        if (ef > ef_limit_) {
+            ef = ef_limit_;
+        }
+    }
+
+    // May this node appear in results? (Routing is never gated by this.)
+    bool eligible(std::uint32_t id, const std::uint64_t* allow,
+                  bool respect_deleted) const noexcept {
+        if (respect_deleted && is_deleted(id)) {
+            return false;
+        }
+        if (allow != nullptr &&
+            ((allow[id >> 6u] >> (id & 63u)) & 1ull) == 0ull) {
+            return false;
+        }
+        return true;
     }
 
     std::uint32_t* link_slots(std::uint32_t id, std::uint32_t layer) noexcept {
@@ -604,22 +762,8 @@ private:
         return (level > kMaxLevel) ? kMaxLevel : level;
     }
 
-    void next_epoch() noexcept {
-        ++epoch_;
-        if (epoch_ == 0u) { // 32-bit wrap: hard reset, then restart at 1
-            std::memset(visited_.get(), 0,
-                        static_cast<std::size_t>(capacity_) * 4u);
-            epoch_ = 1u;
-        }
-    }
-
-    bool is_visited(std::uint32_t id) const noexcept {
-        return visited_[id] == epoch_;
-    }
-
-    void mark_visited(std::uint32_t id) noexcept { visited_[id] = epoch_; }
-
-    // Hill-climb to the closest node on `layer`. Zero-allocation.
+    // Hill-climb to the closest node on `layer`. Zero-allocation. Filters are
+    // irrelevant here: descent only routes.
     void greedy_descend(const std::uint8_t* q, std::uint32_t layer,
                         std::uint32_t& ep, std::uint32_t& ep_dist) const noexcept {
         bool improved = true;
@@ -638,47 +782,72 @@ private:
         }
     }
 
-    // Beam search on one layer (Algorithm 2). Results are left in res_heap_
-    // (a max-heap of at most `ef` best candidates); returns its size.
-    // Zero-allocation: heaps and the visited set are pre-allocated pools.
-    std::uint32_t search_layer(const std::uint8_t* q, std::uint32_t ep,
-                               std::uint32_t ef, std::uint32_t layer) noexcept {
-        next_epoch();
-        cand_heap_.clear();
-        res_heap_.clear();
+    // Upper-layer descent + layer-0 beam, shared by both search modes.
+    // Results are left in ctx.res_heap_; returns its size.
+    std::uint32_t beam_layer0(SearchContext& ctx, const std::uint8_t* q,
+                              std::uint32_t ef,
+                              const std::uint64_t* allow) const noexcept {
+        std::uint32_t ep = entry_;
+        std::uint32_t ep_dist = distance_to(q, ep);
+        for (std::uint32_t l = entry_level_; l > 0u; --l) {
+            greedy_descend(q, l, ep, ep_dist);
+        }
+        return search_layer(ctx, q, ep, ef, 0u, allow, true);
+    }
+
+    // Beam search on one layer (Algorithm 2), with result-eligibility
+    // filtering: ineligible nodes (tombstoned, or cleared in `allow`) still
+    // route within the beam bound but never enter the result heap. Results
+    // are left in ctx.res_heap_ (a max-heap of at most `ef` best eligible
+    // candidates); returns its size. Zero-allocation.
+    std::uint32_t search_layer(SearchContext& ctx, const std::uint8_t* q,
+                               std::uint32_t ep, std::uint32_t ef,
+                               std::uint32_t layer,
+                               const std::uint64_t* allow,
+                               bool respect_deleted) const noexcept {
+        ctx.next_epoch();
+        ctx.cand_heap_.clear();
+        ctx.res_heap_.clear();
 
         const std::uint32_t d0 = distance_to(q, ep);
-        mark_visited(ep);
-        cand_heap_.push(detail::Candidate{d0, ep});
-        res_heap_.push(detail::Candidate{d0, ep});
+        ctx.mark_visited(ep);
+        ctx.cand_heap_.push(detail::Candidate{d0, ep});
+        if (eligible(ep, allow, respect_deleted)) {
+            ctx.res_heap_.push(detail::Candidate{d0, ep});
+        }
 
-        while (!cand_heap_.empty()) {
-            const detail::Candidate c = cand_heap_.top();
-            if (res_heap_.size() >= ef && c.dist > res_heap_.top().dist) {
+        while (!ctx.cand_heap_.empty()) {
+            const detail::Candidate c = ctx.cand_heap_.top();
+            if (ctx.res_heap_.size() >= ef &&
+                c.dist > ctx.res_heap_.top().dist) {
                 break; // nearest unexpanded candidate is worse than the beam
             }
-            cand_heap_.pop();
+            ctx.cand_heap_.pop();
 
             std::uint32_t n = 0u;
             const std::uint32_t* nb = neighbors_of(c.id, layer, n);
             for (std::uint32_t i = 0u; i < n; ++i) {
                 const std::uint32_t e = nb[i];
-                if (is_visited(e)) {
+                if (ctx.is_visited(e)) {
                     continue;
                 }
-                mark_visited(e);
+                ctx.mark_visited(e);
                 const std::uint32_t de = distance_to(q, e);
-                if (res_heap_.size() < ef) {
-                    cand_heap_.push(detail::Candidate{de, e});
-                    res_heap_.push(detail::Candidate{de, e});
-                } else if (de < res_heap_.top().dist) {
-                    cand_heap_.push(detail::Candidate{de, e});
-                    res_heap_.push(detail::Candidate{de, e});
-                    res_heap_.pop();
+                const bool beam_open =
+                    ctx.res_heap_.size() < ef ||
+                    de < ctx.res_heap_.top().dist;
+                if (beam_open) {
+                    ctx.cand_heap_.push(detail::Candidate{de, e});
+                    if (eligible(e, allow, respect_deleted)) {
+                        ctx.res_heap_.push(detail::Candidate{de, e});
+                        if (ctx.res_heap_.size() > ef) {
+                            ctx.res_heap_.pop();
+                        }
+                    }
                 }
             }
         }
-        return res_heap_.size();
+        return ctx.res_heap_.size();
     }
 
     // Neighbor-selection heuristic (Algorithm 4): scanning candidates in
@@ -765,6 +934,159 @@ private:
         cnt = n_sel;
     }
 
+    void reset_graph_state() {
+        std::memset(levels_.get(), 0xFF, capacity_);
+        std::memset(deleted_.get(), 0, deleted_words_ * 8u);
+        for (std::uint32_t i = 0u; i < capacity_; ++i) {
+            links_[i].clear();
+            links_[i].shrink_to_fit();
+            counts_[i].clear();
+            counts_[i].shrink_to_fit();
+        }
+        has_entry_ = false;
+        entry_ = 0u;
+        entry_level_ = 0u;
+        size_ = 0u;
+        deleted_count_ = 0u;
+    }
+
+    static bool read_exact(std::FILE* f, void* dst, std::size_t n) {
+        return std::fread(dst, 1u, n, f) == n;
+    }
+
+    GraphIoStatus load_graph_body(std::FILE* f) {
+        std::uint8_t header[kIoHeaderBytes];
+        if (!read_exact(f, header, sizeof(header))) {
+            return GraphIoStatus::io_error;
+        }
+        if (header[0] != static_cast<std::uint8_t>('E') ||
+            header[1] != static_cast<std::uint8_t>('V') ||
+            header[2] != static_cast<std::uint8_t>('H') ||
+            header[3] != static_cast<std::uint8_t>('G')) {
+            return GraphIoStatus::bad_magic;
+        }
+        std::uint32_t version = 0u;
+        std::memcpy(&version, header + 4u, 4u);
+        if (version == 0u || version > kIoVersion) {
+            return GraphIoStatus::bad_version;
+        }
+        std::uint64_t dim64 = 0u;
+        std::uint32_t capacity = 0u;
+        std::uint32_t m = 0u;
+        std::uint32_t size = 0u;
+        std::uint32_t entry = 0u;
+        std::uint32_t entry_level = 0u;
+        std::uint8_t has_entry = 0u;
+        std::memcpy(&dim64, header + 8u, 8u);
+        std::memcpy(&capacity, header + 16u, 4u);
+        std::memcpy(&m, header + 20u, 4u);
+        std::memcpy(&size, header + 24u, 4u);
+        std::memcpy(&entry, header + 28u, 4u);
+        std::memcpy(&entry_level, header + 32u, 4u);
+        std::memcpy(&has_entry, header + 36u, 1u);
+
+        if (dim64 != static_cast<std::uint64_t>(dim_) ||
+            capacity != capacity_ || m != m_) {
+            return GraphIoStatus::incompatible;
+        }
+        if (size > capacity_ || has_entry > 1u ||
+            (has_entry == 0u && size > 0u) || entry_level > kMaxLevel ||
+            (has_entry == 1u && entry >= capacity_)) {
+            return GraphIoStatus::corrupt;
+        }
+
+        std::uint32_t loaded = 0u;
+        for (std::uint32_t id = 0u; id < capacity_; ++id) {
+            std::uint8_t lvl = 0u;
+            if (!read_exact(f, &lvl, 1u)) {
+                return GraphIoStatus::io_error;
+            }
+            if (lvl == kNotInserted) {
+                continue;
+            }
+            if (static_cast<std::uint32_t>(lvl) > kMaxLevel) {
+                return GraphIoStatus::corrupt;
+            }
+            counts_[id].assign(static_cast<std::size_t>(lvl) + 1u, 0u);
+            links_[id].assign(static_cast<std::size_t>(m0_) +
+                                  static_cast<std::size_t>(lvl) * m_,
+                              0u);
+            if (!read_exact(f, counts_[id].data(), counts_[id].size() * 4u) ||
+                !read_exact(f, links_[id].data(), links_[id].size() * 4u)) {
+                return GraphIoStatus::io_error;
+            }
+            for (std::uint32_t l = 0u; l <= static_cast<std::uint32_t>(lvl); ++l) {
+                if (counts_[id][l] > max_m(l)) {
+                    return GraphIoStatus::corrupt;
+                }
+            }
+            levels_[id] = lvl;
+            ++loaded;
+        }
+
+        if (version >= 2u) {
+            if (!read_exact(f, deleted_.get(), deleted_words_ * 8u)) {
+                return GraphIoStatus::io_error;
+            }
+        }
+
+        std::uint8_t trailing = 0u;
+        if (loaded != size || std::fread(&trailing, 1u, 1u, f) != 0u) {
+            return GraphIoStatus::corrupt; // node count or file length is off
+        }
+
+        // Referential integrity: every link must point at an inserted node
+        // that actually exists on that layer, and never at itself.
+        for (std::uint32_t id = 0u; id < capacity_; ++id) {
+            if (levels_[id] == kNotInserted) {
+                continue;
+            }
+            const std::uint32_t lvl = static_cast<std::uint32_t>(levels_[id]);
+            for (std::uint32_t l = 0u; l <= lvl; ++l) {
+                const std::size_t offset =
+                    (l == 0u) ? 0u
+                              : static_cast<std::size_t>(m0_) +
+                                    static_cast<std::size_t>(l - 1u) * m_;
+                for (std::uint32_t i = 0u; i < counts_[id][l]; ++i) {
+                    const std::uint32_t t = links_[id][offset + i];
+                    if (t >= capacity_ || t == id ||
+                        levels_[t] == kNotInserted ||
+                        static_cast<std::uint32_t>(levels_[t]) < l) {
+                        return GraphIoStatus::corrupt;
+                    }
+                }
+            }
+        }
+        if (has_entry == 1u &&
+            (levels_[entry] == kNotInserted ||
+             static_cast<std::uint32_t>(levels_[entry]) < entry_level)) {
+            return GraphIoStatus::corrupt;
+        }
+
+        // Tombstone integrity: a deleted bit may only mark an inserted node.
+        std::uint32_t n_deleted = 0u;
+        for (std::size_t w = 0u; w < deleted_words_; ++w) {
+            std::uint64_t bits = deleted_[w];
+            while (bits != 0ull) {
+                const std::uint64_t low = bits & (0ull - bits);
+                const std::uint32_t id = static_cast<std::uint32_t>(
+                    w * 64u + static_cast<std::size_t>(__builtin_ctzll(low)));
+                if (id >= capacity_ || levels_[id] == kNotInserted) {
+                    return GraphIoStatus::corrupt;
+                }
+                ++n_deleted;
+                bits ^= low;
+            }
+        }
+
+        has_entry_ = (has_entry == 1u);
+        entry_ = entry;
+        entry_level_ = entry_level;
+        size_ = size;
+        deleted_count_ = n_deleted;
+        return GraphIoStatus::ok;
+    }
+
     // --- immutable configuration -------------------------------------------
     const std::uint8_t* vectors_;
     std::size_t record_bytes_;
@@ -782,19 +1104,17 @@ private:
     std::uint32_t entry_ = 0u;
     std::uint32_t entry_level_ = 0u;
     std::uint32_t size_ = 0u;
+    std::uint32_t deleted_count_ = 0u;
     std::unique_ptr<std::uint8_t[]> levels_;
+    std::size_t deleted_words_ = 0u;
+    std::unique_ptr<std::uint64_t[]> deleted_; // soft-delete tombstones
     std::vector<std::vector<std::uint32_t>> links_;  // per-node flat slot arrays
     std::vector<std::vector<std::uint32_t>> counts_; // per-node per-layer counts
 
-    // --- pre-allocated query scratch (the zero-allocation pools) -----------
-    std::unique_ptr<std::uint32_t[]> visited_;
-    std::uint32_t epoch_ = 0u;
-    std::unique_ptr<detail::Candidate[]> cand_buf_;
-    std::unique_ptr<detail::Candidate[]> res_buf_;
-    std::unique_ptr<detail::Candidate[]> select_buf_; // build path only
-    std::unique_ptr<std::uint32_t[]> selected_;       // build path only
-    detail::FixedHeap<detail::MinHeapCmp> cand_heap_;
-    detail::FixedHeap<detail::MaxHeapCmp> res_heap_;
+    // --- build-path scratch (insert is single-threaded) ---------------------
+    std::unique_ptr<detail::Candidate[]> select_buf_;
+    std::unique_ptr<std::uint32_t[]> selected_;
+    std::unique_ptr<SearchContext> default_ctx_;
 };
 
 } // namespace edgevector
