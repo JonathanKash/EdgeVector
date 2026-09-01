@@ -62,8 +62,20 @@
 // Queries are thread-safe when each thread uses its own SearchContext
 // (graph.make_context()) against a graph that is not being mutated. The
 // no-context convenience overloads use an internal default context and are
-// single-threaded. insert()/remove()/restore()/load_graph() must not run
-// concurrently with anything else.
+// single-threaded.
+//
+// Construction: serial insert() calls are the deterministic path.
+// insert_batch(ids, count, n_threads) builds concurrently with the classic
+// striped-lock scheme (every link mutation and every construction-time
+// neighbor-list read happens under that node's stripe lock; exactly one lock
+// is ever held at a time, so deadlock is impossible by construction). The
+// query hot path takes NO locks and is unchanged. A parallel build is
+// nondeterministic in link structure (insertion order interleaves) but must
+// pass the same integrity validation and recall gates; validate_integrity()
+// runs the loader's full referential check on the in-memory graph.
+// Queries, remove()/restore(), and load_graph() must not run concurrently
+// with any build. On toolchains without std::thread (MinGW win32 model)
+// insert_batch degrades to the serial path.
 //
 // Ties break by (distance, id) everywhere, so results are deterministic and
 // comparable against a brute-force baseline using the same ordering.
@@ -79,6 +91,18 @@
 #include <memory>
 #include <random>
 #include <vector>
+
+// Thread support probe: libstdc++ advertises gthreads; other mainstream
+// standard libraries (libc++) always have <thread>/<mutex>. MinGW's win32
+// thread model lacks them, and insert_batch falls back to the serial path.
+// Define EDGEVECTOR_NO_THREADS to force the serial fallback.
+#if !defined(EDGEVECTOR_NO_THREADS) && \
+    (defined(_GLIBCXX_HAS_GTHREADS) || !defined(__GLIBCXX__))
+#define EDGEVECTOR_HAS_THREADS 1
+#include <atomic>
+#include <mutex>
+#include <thread>
+#endif
 
 #include "edgevector/quantize_math.hpp"
 
@@ -200,7 +224,7 @@ private:
     friend class HNSWGraph;
 
     SearchContext(std::uint32_t capacity, std::uint32_t ef_limit,
-                  std::size_t table_floats)
+                  std::uint32_t m0, std::size_t table_floats)
         : capacity_(capacity) {
         visited_.reset(new std::uint32_t[capacity]);
         std::memset(visited_.get(), 0,
@@ -212,6 +236,14 @@ private:
         scored_buf_.reset(
             new detail::Scored[static_cast<std::size_t>(ef_limit) + 1u]);
         asym_table_.reset(new float[table_floats]);
+        // Build-path scratch: candidate staging for neighbor selection, the
+        // selected-id list, and a bounce buffer for lock-guarded copies of
+        // neighbor lists during concurrent construction.
+        select_buf_.reset(
+            new detail::Candidate[static_cast<std::size_t>(ef_limit) +
+                                  static_cast<std::size_t>(m0) + 2u]);
+        selected_.reset(new std::uint32_t[static_cast<std::size_t>(m0) + 1u]);
+        neigh_buf_.reset(new std::uint32_t[static_cast<std::size_t>(m0)]);
         cand_heap_.init(cand_buf_.get(), capacity + 1u);
         res_heap_.init(res_buf_.get(), ef_limit + 1u);
     }
@@ -236,6 +268,9 @@ private:
     std::unique_ptr<detail::Candidate[]> res_buf_;
     std::unique_ptr<detail::Scored[]> scored_buf_;
     std::unique_ptr<float[]> asym_table_;
+    std::unique_ptr<detail::Candidate[]> select_buf_; // build path
+    std::unique_ptr<std::uint32_t[]> selected_;       // build path
+    std::unique_ptr<std::uint32_t[]> neigh_buf_;      // build path (locked copies)
     detail::FixedHeap<detail::MinHeapCmp> cand_heap_;
     detail::FixedHeap<detail::MaxHeapCmp> res_heap_;
 };
@@ -276,12 +311,20 @@ public:
         deleted_.reset(new std::uint64_t[deleted_words_]);
         std::memset(deleted_.get(), 0, deleted_words_ * 8u);
 
-        select_buf_.reset(new detail::Candidate[static_cast<std::size_t>(ef_limit_) +
-                                                static_cast<std::size_t>(m0_) + 2u]);
-        selected_.reset(new std::uint32_t[static_cast<std::size_t>(m0_) + 1u]);
-
         links_.resize(capacity_);
         counts_.resize(capacity_);
+
+#if defined(EDGEVECTOR_HAS_THREADS)
+        // Striped per-node locks for concurrent construction. Power-of-two
+        // stripe count so lock lookup is a mask; 8192 stripes keeps collision
+        // probability negligible at a fraction of a megabyte.
+        std::uint32_t stripes = 1u;
+        while (stripes < capacity_ && stripes < 8192u) {
+            stripes <<= 1u;
+        }
+        lock_mask_ = stripes - 1u;
+        locks_.reset(new std::mutex[stripes]);
+#endif
 
         default_ctx_.reset(new SearchContext(make_context()));
     }
@@ -299,85 +342,98 @@ public:
     // Allocates a fresh scratch context sized for this graph. Do this once
     // per querying thread, at setup time - never per query.
     SearchContext make_context() const {
-        return SearchContext(capacity_, ef_limit_,
+        return SearchContext(capacity_, ef_limit_, m0_,
                              asymmetric_table_floats(dim_));
     }
 
     // BUILD PATH (allocation permitted). Inserts the vector at index `id` of
     // the external block. Each id may be inserted once; returns false for an
-    // out-of-range or duplicate id. Not thread-safe.
+    // out-of-range or duplicate id. Serial and deterministic; must not run
+    // concurrently with anything.
     bool insert(std::uint32_t id) {
-        if (id >= capacity_ || levels_[id] != kNotInserted) {
+        return insert_impl(*default_ctx_, id, /*locked=*/false);
+    }
+
+    // Concurrent build: inserts `count` ids from `ids` using `n_threads`
+    // worker threads (0 = hardware concurrency). Returns how many inserts
+    // succeeded. The ids array must not contain duplicates. Nondeterministic
+    // link structure (insertion order interleaves), but the graph passes
+    // validate_integrity() and the same recall gates. No queries, removals,
+    // or loads may run concurrently with a build. Falls back to the serial
+    // path when built without thread support or with n_threads <= 1.
+    std::size_t insert_batch(const std::uint32_t* ids, std::size_t count,
+                             unsigned n_threads = 0u) {
+        if (ids == nullptr || count == 0u) {
+            return 0u;
+        }
+#if defined(EDGEVECTOR_HAS_THREADS)
+        if (n_threads == 0u) {
+            n_threads = std::thread::hardware_concurrency();
+            if (n_threads == 0u) {
+                n_threads = 1u;
+            }
+        }
+        if (n_threads > 1u) {
+            std::atomic<std::size_t> next(0u);
+            std::atomic<std::size_t> ok_count(0u);
+            std::vector<std::thread> workers;
+            workers.reserve(n_threads);
+            for (unsigned t = 0u; t < n_threads; ++t) {
+                workers.emplace_back([&]() {
+                    SearchContext ctx = make_context();
+                    for (;;) {
+                        const std::size_t i =
+                            next.fetch_add(1u, std::memory_order_relaxed);
+                        if (i >= count) {
+                            break;
+                        }
+                        if (insert_impl(ctx, ids[i], /*locked=*/true)) {
+                            ok_count.fetch_add(1u, std::memory_order_relaxed);
+                        }
+                    }
+                });
+            }
+            for (std::thread& w : workers) {
+                w.join();
+            }
+            return ok_count.load();
+        }
+#else
+        (void)n_threads;
+#endif
+        std::size_t ok = 0u;
+        for (std::size_t i = 0u; i < count; ++i) {
+            if (insert_impl(*default_ctx_, ids[i], /*locked=*/false)) {
+                ++ok;
+            }
+        }
+        return ok;
+    }
+
+    // Runs the loader's full structural validation on the in-memory graph:
+    // level bounds, per-layer neighbor counts, referential integrity of every
+    // edge (targets inserted, present on that layer, never self), entry-point
+    // consistency, and tombstones only on inserted nodes. For tests and
+    // post-build sanity; not a hot path.
+    bool validate_integrity() const {
+        std::uint32_t inserted = 0u;
+        for (std::uint32_t id = 0u; id < capacity_; ++id) {
+            if (levels_[id] != kNotInserted) {
+                ++inserted;
+            }
+        }
+        if (inserted != size_) {
             return false;
         }
-
-        const std::uint32_t level = random_level();
-        links_[id].assign(static_cast<std::size_t>(m0_) +
-                              static_cast<std::size_t>(level) * m_,
-                          0u);
-        counts_[id].assign(static_cast<std::size_t>(level) + 1u, 0u);
-        levels_[id] = static_cast<std::uint8_t>(level);
-
-        if (!has_entry_) {
-            entry_ = id;
-            entry_level_ = level;
-            has_entry_ = true;
-            ++size_;
-            return true;
-        }
-
-        SearchContext& ctx = *default_ctx_;
-        const std::uint8_t* q = vec(id);
-        std::uint32_t ep = entry_;
-        std::uint32_t ep_dist = distance_to(q, ep);
-
-        for (std::uint32_t l = entry_level_; l > level; --l) {
-            greedy_descend(q, l, ep, ep_dist);
-        }
-
-        const std::uint32_t top = (entry_level_ < level) ? entry_level_ : level;
-        for (std::uint32_t l = top;; --l) {
-            // Build ignores tombstones: deleted nodes keep routing, and links
-            // to them stay valid.
-            const std::uint32_t found = search_layer(
-                ctx, q, ep, ef_construction_, l, nullptr, false);
-
-            const detail::Candidate* raw = ctx.res_heap_.data();
-            for (std::uint32_t i = 0u; i < found; ++i) {
-                select_buf_[i] = raw[i];
+        if (has_entry_) {
+            if (entry_ >= capacity_ || levels_[entry_] == kNotInserted ||
+                static_cast<std::uint32_t>(levels_[entry_]) < entry_level_) {
+                return false;
             }
-            std::sort(select_buf_.get(), select_buf_.get() + found,
-                      detail::candidate_less);
-
-            // Entry point for the next layer down: the closest thing found
-            // here. Saved now because add_link() reuses select_buf_.
-            ep = select_buf_[0].id;
-            ep_dist = select_buf_[0].dist;
-
-            const std::uint32_t mm = max_m(l);
-            const std::uint32_t n_sel = select_neighbors(found, mm);
-
-            std::uint32_t* slots = link_slots(id, l);
-            for (std::uint32_t i = 0u; i < n_sel; ++i) {
-                slots[i] = selected_[i];
-            }
-            counts_[id][l] = n_sel;
-
-            for (std::uint32_t i = 0u; i < n_sel; ++i) {
-                add_link(slots[i], id, l);
-            }
-
-            if (l == 0u) {
-                break;
-            }
+        } else if (size_ > 0u) {
+            return false;
         }
-
-        if (level > entry_level_) {
-            entry_ = id;
-            entry_level_ = level;
-        }
-        ++size_;
-        return true;
+        return graph_invariants_ok();
     }
 
     // Soft delete: the node stops appearing in results but keeps routing
@@ -687,9 +743,212 @@ public:
 
 private:
     static constexpr std::uint8_t kNotInserted = 0xFFu;
+    static constexpr std::uint8_t kClaimed = 0xFEu; // id reserved, links pending
     static constexpr std::uint32_t kMaxLevel = 31u;
     static constexpr std::size_t kIoHeaderBytes = 64u;
     static constexpr std::uint32_t kIoVersion = 2u;
+
+#if defined(EDGEVECTOR_HAS_THREADS)
+    std::mutex& lock_for(std::uint32_t id) const noexcept {
+        return locks_[id & lock_mask_];
+    }
+#endif
+
+    // The one insert implementation. locked == false is the serial,
+    // deterministic path (bit-identical to pre-parallel builds); locked ==
+    // true is the concurrent path, where every read or write of any node's
+    // link storage happens under that node's stripe lock and the entry
+    // point, RNG, id claims, and size counter are mutex-guarded. Exactly one
+    // lock is ever held at a time.
+    bool insert_impl(SearchContext& ctx, std::uint32_t id, bool locked) {
+        if (id >= capacity_) {
+            return false;
+        }
+
+        std::uint32_t level = 0u;
+        if (locked) {
+#if defined(EDGEVECTOR_HAS_THREADS)
+            std::lock_guard<std::mutex> guard(rng_mutex_);
+            if (levels_[id] != kNotInserted) {
+                return false; // duplicate; claim check is atomic with the RNG
+            }
+            levels_[id] = kClaimed; // unreachable until the first reverse link
+            level = random_level();
+#else
+            return false; // locked mode cannot be reached without threads
+#endif
+        } else {
+            if (levels_[id] != kNotInserted) {
+                return false;
+            }
+            level = random_level();
+        }
+
+        links_[id].assign(static_cast<std::size_t>(m0_) +
+                              static_cast<std::size_t>(level) * m_,
+                          0u);
+        counts_[id].assign(static_cast<std::size_t>(level) + 1u, 0u);
+        levels_[id] = static_cast<std::uint8_t>(level);
+
+        // Entry bootstrap / snapshot.
+        std::uint32_t ep = 0u;
+        std::uint32_t start_level = 0u;
+        if (locked) {
+#if defined(EDGEVECTOR_HAS_THREADS)
+            std::lock_guard<std::mutex> guard(entry_mutex_);
+            if (!has_entry_) {
+                entry_ = id;
+                entry_level_ = level;
+                has_entry_ = true;
+                ++size_;
+                return true;
+            }
+            ep = entry_;
+            start_level = entry_level_;
+#endif
+        } else {
+            if (!has_entry_) {
+                entry_ = id;
+                entry_level_ = level;
+                has_entry_ = true;
+                ++size_;
+                return true;
+            }
+            ep = entry_;
+            start_level = entry_level_;
+        }
+
+        const std::uint8_t* q = vec(id);
+        std::uint32_t ep_dist = distance_to(q, ep);
+
+        for (std::uint32_t l = start_level; l > level; --l) {
+            greedy_descend_build(ctx, q, l, ep, ep_dist, locked);
+        }
+
+        const std::uint32_t top = (start_level < level) ? start_level : level;
+        for (std::uint32_t l = top;; --l) {
+            // Build ignores tombstones: deleted nodes keep routing, and links
+            // to them stay valid.
+            const std::uint32_t found = search_layer(
+                ctx, q, ep, ef_construction_, l, nullptr, false, locked);
+
+            const detail::Candidate* raw = ctx.res_heap_.data();
+            for (std::uint32_t i = 0u; i < found; ++i) {
+                ctx.select_buf_[i] = raw[i];
+            }
+            std::sort(ctx.select_buf_.get(), ctx.select_buf_.get() + found,
+                      detail::candidate_less);
+
+            // Entry point for the next layer down: the closest thing found
+            // here. Saved now because add_link() reuses ctx.select_buf_.
+            ep = ctx.select_buf_[0].id;
+            ep_dist = ctx.select_buf_[0].dist;
+
+            const std::uint32_t mm = max_m(l);
+            const std::uint32_t n_sel = select_neighbors(ctx, found, mm);
+
+            // Stable copy of the selected ids for the reverse-link loop:
+            // add_link() reuses ctx.selected_ internally when it prunes, and
+            // in concurrent mode even this node's own slot array can be
+            // rewritten by other threads' prunes mid-loop. neigh_buf_ is
+            // untouched by add_link, so it is the safe staging area.
+            for (std::uint32_t i = 0u; i < n_sel; ++i) {
+                ctx.neigh_buf_[i] = ctx.selected_[i];
+            }
+
+            // The new node's own slots. Under the stripe lock in concurrent
+            // mode: once a higher layer's reverse links published this id,
+            // other threads may add reverse links here concurrently.
+            if (locked) {
+#if defined(EDGEVECTOR_HAS_THREADS)
+                std::lock_guard<std::mutex> guard(lock_for(id));
+                std::uint32_t* slots = link_slots(id, l);
+                for (std::uint32_t i = 0u; i < n_sel; ++i) {
+                    slots[i] = ctx.neigh_buf_[i];
+                }
+                counts_[id][l] = n_sel;
+#endif
+            } else {
+                std::uint32_t* slots = link_slots(id, l);
+                for (std::uint32_t i = 0u; i < n_sel; ++i) {
+                    slots[i] = ctx.neigh_buf_[i];
+                }
+                counts_[id][l] = n_sel;
+            }
+
+            for (std::uint32_t i = 0u; i < n_sel; ++i) {
+                add_link(ctx, ctx.neigh_buf_[i], id, l, locked);
+            }
+
+            if (l == 0u) {
+                break;
+            }
+        }
+
+        if (locked) {
+#if defined(EDGEVECTOR_HAS_THREADS)
+            std::lock_guard<std::mutex> guard(entry_mutex_);
+            if (level > entry_level_) {
+                entry_ = id;
+                entry_level_ = level;
+            }
+            ++size_;
+#endif
+        } else {
+            if (level > entry_level_) {
+                entry_ = id;
+                entry_level_ = level;
+            }
+            ++size_;
+        }
+        return true;
+    }
+
+    // Shared structural invariants, used by validate_integrity() and the
+    // loader: per-layer counts within bounds, every edge pointing at an
+    // inserted node that exists on that layer and is never the node itself,
+    // and tombstones only on inserted nodes.
+    bool graph_invariants_ok() const {
+        for (std::uint32_t id = 0u; id < capacity_; ++id) {
+            if (levels_[id] == kNotInserted) {
+                continue;
+            }
+            const std::uint32_t lvl = static_cast<std::uint32_t>(levels_[id]);
+            if (lvl > kMaxLevel) {
+                return false;
+            }
+            for (std::uint32_t l = 0u; l <= lvl; ++l) {
+                if (counts_[id][l] > max_m(l)) {
+                    return false;
+                }
+                const std::size_t offset =
+                    (l == 0u) ? 0u
+                              : static_cast<std::size_t>(m0_) +
+                                    static_cast<std::size_t>(l - 1u) * m_;
+                for (std::uint32_t i = 0u; i < counts_[id][l]; ++i) {
+                    const std::uint32_t t = links_[id][offset + i];
+                    if (t >= capacity_ || t == id ||
+                        levels_[t] == kNotInserted ||
+                        static_cast<std::uint32_t>(levels_[t]) < l) {
+                        return false;
+                    }
+                }
+            }
+        }
+        for (std::size_t w = 0u; w < deleted_words_; ++w) {
+            std::uint64_t bits = deleted_[w];
+            while (bits != 0ull) {
+                const std::uint64_t low = bits & (0ull - bits);
+                const std::uint32_t id = static_cast<std::uint32_t>(
+                    w * 64u + static_cast<std::size_t>(__builtin_ctzll(low)));
+                if (id >= capacity_ || levels_[id] == kNotInserted) {
+                    return false;
+                }
+                bits ^= low;
+            }
+        }
+        return true;
+    }
 
     const std::uint8_t* vec(std::uint32_t id) const noexcept {
         return vectors_ + static_cast<std::size_t>(id) * record_bytes_;
@@ -763,7 +1022,7 @@ private:
     }
 
     // Hill-climb to the closest node on `layer`. Zero-allocation. Filters are
-    // irrelevant here: descent only routes.
+    // irrelevant here: descent only routes. Query path: lock-free.
     void greedy_descend(const std::uint8_t* q, std::uint32_t layer,
                         std::uint32_t& ep, std::uint32_t& ep_dist) const noexcept {
         bool improved = true;
@@ -771,6 +1030,57 @@ private:
             improved = false;
             std::uint32_t n = 0u;
             const std::uint32_t* nb = neighbors_of(ep, layer, n);
+            for (std::uint32_t i = 0u; i < n; ++i) {
+                const std::uint32_t d = distance_to(q, nb[i]);
+                if (d < ep_dist) {
+                    ep_dist = d;
+                    ep = nb[i];
+                    improved = true;
+                }
+            }
+        }
+    }
+
+    // Snapshot of a node's layer-l neighbor list into the context's bounce
+    // buffer, taken under the node's stripe lock. Used only by concurrent
+    // construction; distances are then computed with no lock held.
+    const std::uint32_t* neighbors_snapshot(SearchContext& ctx,
+                                            std::uint32_t id,
+                                            std::uint32_t layer,
+                                            std::uint32_t& n) const noexcept {
+#if defined(EDGEVECTOR_HAS_THREADS)
+        std::lock_guard<std::mutex> guard(lock_for(id));
+        if (layer > static_cast<std::uint32_t>(levels_[id])) {
+            n = 0u;
+            return nullptr;
+        }
+        n = counts_[id][layer];
+        const std::size_t offset =
+            (layer == 0u) ? 0u
+                          : static_cast<std::size_t>(m0_) +
+                                static_cast<std::size_t>(layer - 1u) * m_;
+        std::memcpy(ctx.neigh_buf_.get(), links_[id].data() + offset,
+                    static_cast<std::size_t>(n) * 4u);
+        return ctx.neigh_buf_.get();
+#else
+        (void)ctx;
+        return neighbors_of(id, layer, n);
+#endif
+    }
+
+    // Descent used during construction; takes snapshots when concurrent.
+    void greedy_descend_build(SearchContext& ctx, const std::uint8_t* q,
+                              std::uint32_t layer, std::uint32_t& ep,
+                              std::uint32_t& ep_dist, bool locked) const noexcept {
+        if (!locked) {
+            greedy_descend(q, layer, ep, ep_dist);
+            return;
+        }
+        bool improved = true;
+        while (improved) {
+            improved = false;
+            std::uint32_t n = 0u;
+            const std::uint32_t* nb = neighbors_snapshot(ctx, ep, layer, n);
             for (std::uint32_t i = 0u; i < n; ++i) {
                 const std::uint32_t d = distance_to(q, nb[i]);
                 if (d < ep_dist) {
@@ -804,7 +1114,8 @@ private:
                                std::uint32_t ep, std::uint32_t ef,
                                std::uint32_t layer,
                                const std::uint64_t* allow,
-                               bool respect_deleted) const noexcept {
+                               bool respect_deleted,
+                               bool locked = false) const noexcept {
         ctx.next_epoch();
         ctx.cand_heap_.clear();
         ctx.res_heap_.clear();
@@ -825,7 +1136,9 @@ private:
             ctx.cand_heap_.pop();
 
             std::uint32_t n = 0u;
-            const std::uint32_t* nb = neighbors_of(c.id, layer, n);
+            const std::uint32_t* nb =
+                locked ? neighbors_snapshot(ctx, c.id, layer, n)
+                       : neighbors_of(c.id, layer, n);
             for (std::uint32_t i = 0u; i < n; ++i) {
                 const std::uint32_t e = nb[i];
                 if (ctx.is_visited(e)) {
@@ -864,21 +1177,23 @@ private:
     // distributions. Low recall on iid random data is NOT a graph defect: it
     // is the intrinsic-dimensionality wall every ANN index hits on
     // structureless data; see the benchmark's two scenarios.)
-    std::uint32_t select_neighbors(std::uint32_t n_candidates, std::uint32_t mm) {
+    std::uint32_t select_neighbors(SearchContext& ctx,
+                                   std::uint32_t n_candidates,
+                                   std::uint32_t mm) {
         std::uint32_t n_sel = 0u;
         for (std::uint32_t i = 0u; i < n_candidates && n_sel < mm; ++i) {
-            const detail::Candidate c = select_buf_[i];
+            const detail::Candidate c = ctx.select_buf_[i];
             bool keep = true;
             for (std::uint32_t s = 0u; s < n_sel; ++s) {
                 const std::uint32_t d_cs =
-                    hamming_distance(vec(c.id), vec(selected_[s]), dim_);
+                    hamming_distance(vec(c.id), vec(ctx.selected_[s]), dim_);
                 if (d_cs < c.dist) {
                     keep = false;
                     break;
                 }
             }
             if (keep) {
-                selected_[n_sel] = c.id;
+                ctx.selected_[n_sel] = c.id;
                 ++n_sel;
             }
         }
@@ -886,16 +1201,16 @@ private:
         // keepPrunedConnections: top up with the pruned candidates in
         // ascending distance until the slots are full or candidates run out.
         for (std::uint32_t i = 0u; i < n_candidates && n_sel < mm; ++i) {
-            const std::uint32_t cand_id = select_buf_[i].id;
+            const std::uint32_t cand_id = ctx.select_buf_[i].id;
             bool already = false;
             for (std::uint32_t s = 0u; s < n_sel; ++s) {
-                if (selected_[s] == cand_id) {
+                if (ctx.selected_[s] == cand_id) {
                     already = true;
                     break;
                 }
             }
             if (!already) {
-                selected_[n_sel] = cand_id;
+                ctx.selected_[n_sel] = cand_id;
                 ++n_sel;
             }
         }
@@ -904,8 +1219,25 @@ private:
 
     // Add the reverse link from -> to on `layer`; when the slot array is
     // full, re-select the best max_m(layer) from {existing neighbors, to}
-    // with the same heuristic, measured from `from`. Build path only.
-    void add_link(std::uint32_t from, std::uint32_t to, std::uint32_t layer) {
+    // with the same heuristic, measured from `from`. Build path only. In
+    // concurrent mode the whole read-modify-write runs under `from`'s stripe
+    // lock (the only lock held).
+    void add_link(SearchContext& ctx, std::uint32_t from, std::uint32_t to,
+                  std::uint32_t layer, bool locked) {
+#if defined(EDGEVECTOR_HAS_THREADS)
+        if (locked) {
+            std::lock_guard<std::mutex> guard(lock_for(from));
+            add_link_unlocked(ctx, from, to, layer);
+            return;
+        }
+#else
+        (void)locked;
+#endif
+        add_link_unlocked(ctx, from, to, layer);
+    }
+
+    void add_link_unlocked(SearchContext& ctx, std::uint32_t from,
+                           std::uint32_t to, std::uint32_t layer) {
         const std::uint32_t mm = max_m(layer);
         std::uint32_t& cnt = counts_[from][layer];
         std::uint32_t* slots = link_slots(from, layer);
@@ -919,17 +1251,18 @@ private:
         const std::uint8_t* base = vec(from);
         std::uint32_t n = 0u;
         for (std::uint32_t i = 0u; i < cnt; ++i) {
-            select_buf_[n] = detail::Candidate{distance_to(base, slots[i]), slots[i]};
+            ctx.select_buf_[n] =
+                detail::Candidate{distance_to(base, slots[i]), slots[i]};
             ++n;
         }
-        select_buf_[n] = detail::Candidate{distance_to(base, to), to};
+        ctx.select_buf_[n] = detail::Candidate{distance_to(base, to), to};
         ++n;
-        std::sort(select_buf_.get(), select_buf_.get() + n,
+        std::sort(ctx.select_buf_.get(), ctx.select_buf_.get() + n,
                   detail::candidate_less);
 
-        const std::uint32_t n_sel = select_neighbors(n, mm);
+        const std::uint32_t n_sel = select_neighbors(ctx, n, mm);
         for (std::uint32_t i = 0u; i < n_sel; ++i) {
-            slots[i] = selected_[i];
+            slots[i] = ctx.selected_[i];
         }
         cnt = n_sel;
     }
@@ -1035,27 +1368,10 @@ private:
             return GraphIoStatus::corrupt; // node count or file length is off
         }
 
-        // Referential integrity: every link must point at an inserted node
-        // that actually exists on that layer, and never at itself.
-        for (std::uint32_t id = 0u; id < capacity_; ++id) {
-            if (levels_[id] == kNotInserted) {
-                continue;
-            }
-            const std::uint32_t lvl = static_cast<std::uint32_t>(levels_[id]);
-            for (std::uint32_t l = 0u; l <= lvl; ++l) {
-                const std::size_t offset =
-                    (l == 0u) ? 0u
-                              : static_cast<std::size_t>(m0_) +
-                                    static_cast<std::size_t>(l - 1u) * m_;
-                for (std::uint32_t i = 0u; i < counts_[id][l]; ++i) {
-                    const std::uint32_t t = links_[id][offset + i];
-                    if (t >= capacity_ || t == id ||
-                        levels_[t] == kNotInserted ||
-                        static_cast<std::uint32_t>(levels_[t]) < l) {
-                        return GraphIoStatus::corrupt;
-                    }
-                }
-            }
+        // Structural validation: referential integrity of every edge and
+        // tombstone integrity, shared with validate_integrity().
+        if (!graph_invariants_ok()) {
+            return GraphIoStatus::corrupt;
         }
         if (has_entry == 1u &&
             (levels_[entry] == kNotInserted ||
@@ -1063,20 +1379,10 @@ private:
             return GraphIoStatus::corrupt;
         }
 
-        // Tombstone integrity: a deleted bit may only mark an inserted node.
         std::uint32_t n_deleted = 0u;
         for (std::size_t w = 0u; w < deleted_words_; ++w) {
-            std::uint64_t bits = deleted_[w];
-            while (bits != 0ull) {
-                const std::uint64_t low = bits & (0ull - bits);
-                const std::uint32_t id = static_cast<std::uint32_t>(
-                    w * 64u + static_cast<std::size_t>(__builtin_ctzll(low)));
-                if (id >= capacity_ || levels_[id] == kNotInserted) {
-                    return GraphIoStatus::corrupt;
-                }
-                ++n_deleted;
-                bits ^= low;
-            }
+            n_deleted += static_cast<std::uint32_t>(
+                __builtin_popcountll(deleted_[w]));
         }
 
         has_entry_ = (has_entry == 1u);
@@ -1111,10 +1417,14 @@ private:
     std::vector<std::vector<std::uint32_t>> links_;  // per-node flat slot arrays
     std::vector<std::vector<std::uint32_t>> counts_; // per-node per-layer counts
 
-    // --- build-path scratch (insert is single-threaded) ---------------------
-    std::unique_ptr<detail::Candidate[]> select_buf_;
-    std::unique_ptr<std::uint32_t[]> selected_;
+    // --- build-path infrastructure ------------------------------------------
     std::unique_ptr<SearchContext> default_ctx_;
+#if defined(EDGEVECTOR_HAS_THREADS)
+    std::unique_ptr<std::mutex[]> locks_; // striped per-node link locks
+    std::uint32_t lock_mask_ = 0u;
+    std::mutex entry_mutex_; // entry point, has_entry_, size_
+    std::mutex rng_mutex_;   // level generation and id claims
+#endif
 };
 
 } // namespace edgevector

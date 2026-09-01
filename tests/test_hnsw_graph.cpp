@@ -702,6 +702,89 @@ void test_persistence(edgevector::HNSWGraph& graph, const RecordBlock& data,
     std::remove(kBadFile);
 }
 
+// ---------------------------------------------------------------------------
+// Case 10: concurrent construction — a parallel build must produce a
+// structurally valid graph that meets the same recall gate, and the
+// single-threaded batch path must be bit-identical to serial insert().
+// ---------------------------------------------------------------------------
+void test_parallel_build(edgevector::HNSWGraph& serial_graph,
+                         const RecordBlock& data, std::size_t dim,
+                         std::size_t n) {
+    std::printf("[10] Concurrent construction (insert_batch)\n");
+
+    check(serial_graph.validate_integrity(),
+          "serially built graph passes validate_integrity()");
+
+    std::vector<std::uint32_t> ids(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        ids[i] = static_cast<std::uint32_t>(i);
+    }
+
+    // threads = 1 must reproduce the serial graph exactly (same RNG stream,
+    // same insertion order, same code path).
+    edgevector::HNSWGraph one_thread(data.base(), data.record_bytes(), dim,
+                                     static_cast<std::uint32_t>(n),
+                                     /*m=*/16u, /*ef_construction=*/200u,
+                                     /*max_ef_search=*/256u, /*seed=*/42u);
+    check(one_thread.insert_batch(ids.data(), n, 1u) == n,
+          "insert_batch(threads = 1) inserts every id");
+
+    std::mt19937 rng(37);
+    std::normal_distribution<float> dist(0.0f, 1.0f);
+    std::vector<float> raw(dim);
+    std::vector<std::uint64_t> qwords(edgevector::padded_bytes(dim) / 8u, 0u);
+    std::uint8_t* qbytes = reinterpret_cast<std::uint8_t*>(qwords.data());
+    edgevector::SearchResult a[10];
+    edgevector::SearchResult b[10];
+
+    bool identical = true;
+    for (int t = 0; t < 10; ++t) {
+        for (std::size_t d = 0; d < dim; ++d) {
+            raw[d] = dist(rng);
+        }
+        edgevector::quantize(raw.data(), dim, qbytes);
+        const std::uint32_t fa = serial_graph.search(qbytes, 10u, 100u, a);
+        const std::uint32_t fb = one_thread.search(qbytes, 10u, 100u, b);
+        if (fa != fb) {
+            identical = false;
+            continue;
+        }
+        for (std::uint32_t i = 0; i < fa; ++i) {
+            if (a[i].id != b[i].id || a[i].distance != b[i].distance) {
+                identical = false;
+            }
+        }
+    }
+    check(identical,
+          "insert_batch(threads = 1) is bit-identical to serial insert()");
+
+    // Genuinely concurrent build (4 threads where the toolchain has them;
+    // insert_batch degrades to serial otherwise, which still validates).
+#if defined(EDGEVECTOR_HAS_THREADS)
+    std::printf("      (std::thread available: building with 4 threads)\n");
+#else
+    std::printf("      (std::thread unavailable: batch runs serially)\n");
+#endif
+    edgevector::HNSWGraph parallel(data.base(), data.record_bytes(), dim,
+                                   static_cast<std::uint32_t>(n),
+                                   /*m=*/16u, /*ef_construction=*/200u,
+                                   /*max_ef_search=*/256u, /*seed=*/42u);
+    check(parallel.insert_batch(ids.data(), n, 4u) == n,
+          "parallel insert_batch inserts every id");
+    check(parallel.size() == n, "size() correct after parallel build");
+    check(parallel.validate_integrity(),
+          "parallel graph passes full referential-integrity validation");
+    check(parallel.insert_batch(ids.data(), n, 4u) == 0u,
+          "re-inserting the same ids is fully rejected");
+
+    std::mt19937 rrng(41);
+    const double recall =
+        measure_recall(parallel, data, dim, 20u, 10u, 100u, rrng);
+    std::printf("      parallel-build recall@10 = %.4f  (gate >= 0.90)\n",
+                recall);
+    check(recall >= 0.90, "parallel-built graph meets the recall gate");
+}
+
 } // namespace
 
 int main() {
@@ -733,6 +816,7 @@ int main() {
     test_contexts_and_threads(graph, graph, dim);
     test_delete_and_filter(dim);
     test_reranked_accuracy(graph, floats, n, dim);
+    test_parallel_build(graph, data, dim, n);
 
     std::printf("\n=== %s ===\n",
                 (g_failures == 0) ? "ALL CASES PASSED" : "FAILURES DETECTED");

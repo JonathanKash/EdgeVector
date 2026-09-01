@@ -12,8 +12,10 @@ zero dependencies — with a two-stage retrieval pipeline that reaches
   `ef` of them
 - **Zero-allocation queries, proven** — every search mode is covered by tests
   that replace the global `operator new` and require **zero** allocations
-- **Concurrent queries** — per-thread `SearchContext` scratch pools; verified
-  with a real multi-thread test
+- **Concurrent queries and concurrent construction** — per-thread
+  `SearchContext` scratch pools for queries, and a striped-lock parallel
+  build: 100k vectors in **7.9 s on 12 threads vs 64.3 s serial (8.1x)**,
+  validated by a full referential-integrity sweep after every parallel build
 - **Soft deletion and filtered search** — tombstones plus caller-supplied
   allow-bitmaps, composable, persisted in the graph file
 - **~0.05 s startup at 100k vectors** — mmap the codes, load the prebuilt
@@ -66,8 +68,8 @@ removes.
 |---|---|
 | Quantized vectors (RAM) | 6.4 MB (float32 equivalent: 204.8 MB — 32x) |
 | Graph links + scratch | 15.0 MB |
-| Build (one-time, 1 thread) | 62.7 s |
-| Load prebuilt graph at startup | 0.043 s (~1,400x faster than rebuilding) |
+| Build (one-time): 1 thread / 12 threads | 64.3 s / **7.9 s** (8.1x, integrity-validated) |
+| Load prebuilt graph at startup | 0.035 s (~1,800x faster than rebuilding) |
 
 ```mermaid
 xychart-beta
@@ -150,7 +152,10 @@ for (std::uint32_t i = 0; i < n; ++i)
 write_storage_file("index.evec", dim, n, base);
 
 HNSWGraph builder(base, rb, dim, n);                   // M=16, efC=200 defaults
-for (std::uint32_t i = 0; i < n; ++i) builder.insert(i);
+std::vector<std::uint32_t> ids(n);
+std::iota(ids.begin(), ids.end(), 0u);
+builder.insert_batch(ids.data(), n, 0);                // 0 = all hardware threads
+// (or serial, deterministic: for (auto id : ids) builder.insert(id);)
 builder.save_graph("index.evhg");
 
 // ---- Device startup (no rebuild: map codes, load graph) -----------------
@@ -247,8 +252,10 @@ against float32 ground truth, graph persistence round-trips (bitwise-identical
 results and surviving tombstones after reload), context isolation plus a
 4-thread concurrency test, delete/restore/filter composition, ITQ invariants
 (orthogonality, exact cosine preservation, monotone objective, determinism,
-hostile-file rejection, end-to-end recall gain), and the zero-allocation
-proof for all three search modes.
+hostile-file rejection, end-to-end recall gain), concurrent construction
+(single-thread batch bit-identical to serial insert; 4-thread build passing
+the full referential-integrity sweep and the recall gate), and the
+zero-allocation proof for all three search modes.
 
 **AArch64:** `tests/arm64.Dockerfile` reproduces the ARM validation — all
 five suites compiled by native arm64 g++ 13 at `-march=armv8-a -Werror` and
@@ -259,16 +266,21 @@ including bit-identical ITQ training results vs x86-64 — is validated.
 
 ## Status and roadmap
 
-v0.4. Known limitations, in priority order:
+v0.5. Known limitations, in priority order:
 
 1. **Insert-only capacity** — soft delete exists, but slots are never
    reclaimed and capacity is fixed at construction
 2. **Highly selective filters degrade** toward a scan of the reachable graph
    (true of every filtered-HNSW implementation; documented, not hidden)
 3. **ARM validated for correctness, not yet for performance** — all suites
-   pass on aarch64 under QEMU emulation with NEON popcount codegen confirmed,
-   but latency/QPS numbers on real ARM silicon are still pending
-4. Build is single-threaded (queries are not)
+   pass on aarch64 under QEMU emulation (including the 4-thread build and
+   query tests) with NEON popcount codegen confirmed, but latency/QPS
+   numbers on real ARM silicon are still pending; QEMU on an x86 host also
+   only partially exercises ARM's weaker memory model (the build's
+   correctness rests on mutex ordering, not x86 TSO, by design)
+4. **Parallel builds are nondeterministic** in link structure (insertion
+   order interleaves); use serial `insert()` or `insert_batch(..., 1)` when
+   bit-reproducible graphs matter
 
 If you need a mature production system in this space today, look at
 [USearch](https://github.com/unum-cloud/usearch) or

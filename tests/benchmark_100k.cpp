@@ -170,9 +170,39 @@ void run_scenario(const char* name, bool clustered, bool full_report) {
         const double load_s = seconds_since(t0);
         std::remove(kGraphFile);
 
+        // Parallel build on a throwaway graph: the serial graph stays the
+        // one measured below so recall/latency numbers remain comparable.
+        double par_build_s = 0.0;
+        unsigned hw_threads = 1u;
+        bool par_ok = false;
+        {
+#if defined(EDGEVECTOR_HAS_THREADS)
+            hw_threads = std::thread::hardware_concurrency();
+            if (hw_threads == 0u) {
+                hw_threads = 1u;
+            }
+#endif
+            std::vector<std::uint32_t> ids(kN);
+            for (std::size_t i = 0; i < kN; ++i) {
+                ids[i] = static_cast<std::uint32_t>(i);
+            }
+            edgevector::HNSWGraph par(data.base(), data.record_bytes(), kDim,
+                                      static_cast<std::uint32_t>(kN),
+                                      16u, 200u, 256u, 42u);
+            t0 = Clock::now();
+            const std::size_t inserted =
+                par.insert_batch(ids.data(), kN, hw_threads);
+            par_build_s = seconds_since(t0);
+            par_ok = (inserted == kN) && par.validate_integrity();
+        }
+
         std::printf("| Stage | Time |\n|---|---|\n");
         std::printf("| Build (insert %zu vectors, 1 thread) | %.1f s |\n",
                     kN, build_s);
+        std::printf("| Build, insert_batch (%u threads) | %.1f s (%.1fx; "
+                    "integrity %s) |\n",
+                    hw_threads, par_build_s, build_s / par_build_s,
+                    par_ok ? "validated" : "FAILED");
         std::printf("| Save graph | %.3f s |\n", save_s);
         std::printf("| Load graph (startup cost with persistence) | %.3f s |\n",
                     load_s);
