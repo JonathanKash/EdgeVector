@@ -49,8 +49,11 @@
 // small relative to the beam (popcount(allow) <= 16 * ef; the popcount is a
 // ~microsecond pass over the bitmap), the search switches to a direct scan
 // of the allowed ids, which is both cheaper AND exact - recall 1.0 over the
-// allowed set by construction. Larger filters keep the graph traversal, with
-// filtered-out nodes still routing. Both paths are zero-allocation.
+// allowed set by construction. The measured default policy scans while
+// popcount(allow) <= max(16 * ef, capacity / 8) - see
+// set_filter_scan_limit() to override. Larger filters keep the graph
+// traversal, with filtered-out nodes still routing. Both paths are
+// zero-allocation.
 //
 // DELETION AND SLOT RECLAMATION
 // -----------------------------
@@ -557,6 +560,20 @@ public:
 
     bool is_deleted(std::uint32_t id) const noexcept {
         return ((deleted_[id >> 6u] >> (id & 63u)) & 1ull) != 0ull;
+    }
+
+    // Filtered-search strategy override: filtered queries take the exact
+    // allowed-set scan while popcount(allow) <= limit, the routed graph
+    // traversal above it. Pass kFilterScanAuto (the default) for the
+    // measured policy max(16*ef, capacity/8); 0 forces traversal always;
+    // UINT64_MAX forces the scan always. Not thread-safe against concurrent
+    // queries; set it at configuration time.
+    static constexpr std::uint64_t kFilterScanAuto = ~0ull - 1u;
+    void set_filter_scan_limit(std::uint64_t limit) noexcept {
+        filter_scan_limit_ = limit;
+    }
+    std::uint64_t filter_scan_limit() const noexcept {
+        return filter_scan_limit_;
     }
 
     // Slot reclamation: relinks a tombstoned id around the NEW vector bytes
@@ -1370,13 +1387,27 @@ private:
 
     // The candidate-pool collector behind all three search modes: picks the
     // scan for sparse filters (exact and cheaper), the beam otherwise.
+    // Crossover measured empirically (see the benchmark's filtered table):
+    // the scan's cost is ~one Hamming distance per allowed id, while a
+    // filter-throttled traversal costs several times the unfiltered walk, so
+    // scanning wins until the allowed set is a sizeable fraction of the
+    // whole index. Default policy: scan while allowed <= max(16*ef,
+    // capacity/8); override with set_filter_scan_limit().
     std::uint32_t collect_pool(SearchContext& ctx, const std::uint8_t* q,
                                std::uint32_t ef,
                                const std::uint64_t* allow) const noexcept {
-        if (allow != nullptr &&
-            popcount_allow(allow) <=
-                static_cast<std::uint64_t>(ef) * 16u) {
-            return filtered_scan(ctx, q, ef, allow);
+        if (allow != nullptr) {
+            std::uint64_t limit = filter_scan_limit_;
+            if (limit == kFilterScanAuto) {
+                const std::uint64_t ef_floor =
+                    static_cast<std::uint64_t>(ef) * 16u;
+                const std::uint64_t cap_share =
+                    static_cast<std::uint64_t>(capacity_) / 8u;
+                limit = (ef_floor > cap_share) ? ef_floor : cap_share;
+            }
+            if (popcount_allow(allow) <= limit) {
+                return filtered_scan(ctx, q, ef, allow);
+            }
         }
         return beam_layer0(ctx, q, ef, allow);
     }
@@ -1694,6 +1725,7 @@ private:
     std::uint32_t ef_construction_;
     std::uint32_t ef_limit_ = 0u;
     double ml_ = 0.0;
+    std::uint64_t filter_scan_limit_ = kFilterScanAuto;
     std::mt19937_64 rng_;
 
     // --- graph state --------------------------------------------------------

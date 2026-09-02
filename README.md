@@ -115,11 +115,15 @@ this one carries scale.)
 ### Filtered search: selectivity-adaptive
 
 A sparse allow-bitmap makes graph traversal the wrong algorithm (too few
-eligible nodes ever fill the beam), so when `popcount(allow) ≤ 16·ef` the
-search switches to a zero-allocation **exact scan of the allowed set** —
-cheaper than the degraded walk *and* recall-1.0 by construction. Measured at
-100k vectors, ef = 100, k = 10, against exact filtered ground truth (arm64
-CI runner, single thread):
+eligible nodes ever fill the beam), so while
+`popcount(allow) ≤ max(16·ef, capacity/8)` the search switches to a
+zero-allocation **exact scan of the allowed set** — cheaper than the
+degraded walk *and* recall-1.0 by construction. The crossover was measured,
+not guessed: scanning wins up to ~15–20% selectivity (at 2%, the scan is
+88 µs/1.000 recall vs 6,654 µs/0.989 for forced traversal), so the default
+switches at 12.5% of capacity; `set_filter_scan_limit()` overrides it.
+Measured at 100k vectors, ef = 100, k = 10, against exact filtered ground
+truth (arm64 CI runner, single thread):
 
 | selectivity | allowed ids | recall@10 | mean latency | QPS (1 thread) |
 |---|---|---|---|---|
@@ -443,10 +447,13 @@ v0.8. Known limitations, in priority order:
    invalidates outstanding `SearchContext`s (their searches safely return 0
    until recreated). Growing the vector block itself is the caller's job —
    an mmap'ed block means writing and remapping a larger file
-2. **Mid-selectivity filters (roughly 5–50%) still pay a traversal penalty**
-   — sparse filters get the exact scan and dense filters barely notice, but
-   the band in between runs the routed walk with a partially-filled beam
-   (0.998 recall at 10%, at ~10x the unfiltered latency)
+2. **Filters between ~12.5% and ~50% selectivity pay a traversal penalty** —
+   below the measured crossover the exact scan is both faster and perfect;
+   above ~50% the beam barely notices; the band between runs the routed walk
+   with a partially-filled beam (recall ~0.94–0.98 at a few-fold latency
+   cost). An ACORN-style two-hop expansion was evaluated and rejected: it
+   targets recall (already ≥0.94 here) at the price of latency (the actual
+   cost), so it does not earn its complexity
 3. **Parallel builds are nondeterministic** in link structure (insertion
    order interleaves); use serial `insert()` or `insert_batch(..., 1)` when
    bit-reproducible graphs matter
