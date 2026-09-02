@@ -211,6 +211,45 @@ performance — run `make -C tests bench` on your actual silicon (the
 Makefile's `ARCH`/`RUNNER` knobs make that a ten-minute job) before
 committing a product.
 
+## Getting it into your project
+
+Three routes, all ending at `#include <edgevector/edgevector.hpp>` (one
+umbrella header; or include the individual headers you use). Requires GCC or
+Clang with C++17 — MSVC is not supported.
+
+**1. Vendor the headers (firmware-style).** Copy `include/edgevector/` into
+your tree, add the directory to your include path. Done — there is nothing
+to link.
+
+**2. CMake FetchContent:**
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(edgevector
+  GIT_REPOSITORY https://github.com/JonathanKash/EdgeVector.git
+  GIT_TAG main)          # or pin a commit
+FetchContent_MakeAvailable(edgevector)
+target_link_libraries(your_app PRIVATE edgevector::edgevector)
+```
+
+**3. CMake subdirectory:** vendor the repo and `add_subdirectory(EdgeVector)`;
+the same `edgevector::edgevector` target appears.
+
+Then start from **`examples/quickstart.cpp`** — a complete, runnable,
+self-checking tour of the whole pipeline (quantize → multi-threaded build →
+persist → reload → all three search modes → filtering → deletion → slot
+reclamation), built and executed by CI on every push so it can never drift
+from the library:
+
+```sh
+make -C examples run                                  # or:
+cmake -B build -DEDGEVECTOR_BUILD_EXAMPLES=ON && cmake --build build && ./build/quickstart
+```
+
+Compile flags that matter: `-O2 -march=native` (or `-march=armv8-a` when
+cross-compiling) so the Hamming kernel gets POPCNT/AVX2 or NEON.
+`EDGEVECTOR_VERSION` in `edgevector.hpp` identifies the vendored version.
+
 ## Quick start
 
 Everything is three `#include`s; no linking, no build step for the library
