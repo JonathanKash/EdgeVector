@@ -21,3 +21,6 @@ examples/quickstart.exe
 examples/*.evec
 examples/*.evhg
 build/
+
+# Claude Code session artifacts
+.claude/
