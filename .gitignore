@@ -18,6 +18,9 @@ tests/wsl_results/
 # Example build artifacts
 examples/quickstart
 examples/quickstart.exe
+examples/itq_pipeline
+examples/itq_pipeline.exe
+examples/*.evrt
 examples/*.evec
 examples/*.evhg
 build/

@@ -14,10 +14,15 @@ endif
 quickstart$(EXE): quickstart.cpp $(wildcard ../include/edgevector/*.hpp)
 	$(CXX) $(CXXFLAGS) -I../include quickstart.cpp -o $@
 
-run: quickstart$(EXE)
+itq_pipeline$(EXE): itq_pipeline.cpp $(wildcard ../include/edgevector/*.hpp)
+	$(CXX) $(CXXFLAGS) -I../include itq_pipeline.cpp -o $@
+
+run: quickstart$(EXE) itq_pipeline$(EXE)
 	$(RUNNER) ./quickstart$(EXE)
+	$(RUNNER) ./itq_pipeline$(EXE)
 
 clean:
-	rm -f quickstart$(EXE) quickstart.evec quickstart.evhg
+	rm -f quickstart$(EXE) itq_pipeline$(EXE) quickstart.evec quickstart.evhg \
+	      itq_example.evrt
 
 .PHONY: run clean
