@@ -73,6 +73,20 @@ jobs:
       - name: Test (release, -DNDEBUG)
         run: make -C tests run-release
 
+  quickstart:
+    name: Quickstart example (make + CMake)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run via make
+        run: make -C examples run
+      - name: Build and run via CMake (consumer integration path)
+        run: |
+          cmake -B build -DEDGEVECTOR_BUILD_EXAMPLES=ON
+          cmake --build build
+          ./build/quickstart
+
   asan-ubsan:
     name: ASan + UBSan
     runs-on: ubuntu-24.04
