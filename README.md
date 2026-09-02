@@ -31,6 +31,10 @@ zero dependencies — with a two-stage retrieval pipeline that reaches
   (`remove` → overwrite bytes → `reinsert`, zero dangling edges by
   construction); and growable capacity (`grow()` extends the id space and
   rebinds a relocated vector block, preserving every existing link)
+- **Selectivity-adaptive filtering** — sparse filters switch to an exact
+  scan of the allowed set: recall **1.000** at 7 µs/query for a 0.1% filter
+  (faster than unfiltered search), while dense filters keep routed traversal
+  (0.998 recall at 10%)
 - **~0.05 s startup at 100k vectors** — mmap the codes, load the prebuilt
   graph (~1,400x faster than rebuilding)
 - **Learned ITQ rotation** for anisotropic (real-embedding-shaped) data:
@@ -107,6 +111,26 @@ Same recipe at 1,000,000 × 512-d (clustered), single-thread queries:
 (Float32-truth metrics at 1M are omitted — the exact ground truth would need
 2 GB of resident floats; the 100k tables above carry the accuracy story,
 this one carries scale.)
+
+### Filtered search: selectivity-adaptive
+
+A sparse allow-bitmap makes graph traversal the wrong algorithm (too few
+eligible nodes ever fill the beam), so when `popcount(allow) ≤ 16·ef` the
+search switches to a zero-allocation **exact scan of the allowed set** —
+cheaper than the degraded walk *and* recall-1.0 by construction. Measured at
+100k vectors, ef = 100, k = 10, against exact filtered ground truth (arm64
+CI runner, single thread):
+
+| selectivity | allowed ids | recall@10 | mean latency | QPS (1 thread) |
+|---|---|---|---|---|
+| 0.1% | 100 | **1.000** | 7 µs | 145,744 |
+| 1% | 1,000 | **1.000** | 30 µs | 33,171 |
+| 10% | 10,000 | 0.998 | 745 µs | 1,342 |
+
+The sparse rows take the exact-scan path — note they are *faster than
+unfiltered search* (7 µs vs 72 µs at ef = 100 on the same runner). The 10%
+row exercises the routed graph traversal. Tests gate the scan path equal to
+brute force on ids and distances both.
 
 ```mermaid
 xychart-beta
@@ -419,8 +443,10 @@ v0.8. Known limitations, in priority order:
    invalidates outstanding `SearchContext`s (their searches safely return 0
    until recreated). Growing the vector block itself is the caller's job —
    an mmap'ed block means writing and remapping a larger file
-2. **Highly selective filters degrade** toward a scan of the reachable graph
-   (true of every filtered-HNSW implementation; documented, not hidden)
+2. **Mid-selectivity filters (roughly 5–50%) still pay a traversal penalty**
+   — sparse filters get the exact scan and dense filters barely notice, but
+   the band in between runs the routed walk with a partially-filled beam
+   (0.998 recall at 10%, at ~10x the unfiltered latency)
 3. **Parallel builds are nondeterministic** in link structure (insertion
    order interleaves); use serial `insert()` or `insert_batch(..., 1)` when
    bit-reproducible graphs matter
