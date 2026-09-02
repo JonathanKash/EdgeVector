@@ -227,7 +227,7 @@ to link.
 include(FetchContent)
 FetchContent_Declare(edgevector
   GIT_REPOSITORY https://github.com/JonathanKash/EdgeVector.git
-  GIT_TAG main)          # or pin a commit
+  GIT_TAG v0.8.0)        # or a commit hash, or main for latest
 FetchContent_MakeAvailable(edgevector)
 target_link_libraries(your_app PRIVATE edgevector::edgevector)
 ```
@@ -373,7 +373,7 @@ supported). Linux, WSL, or MinGW-w64 on Windows.
 
 ```sh
 cd tests
-make run          # 5 test suites, asserts enabled
+make run          # 6 test suites, asserts enabled
 make run-release  # same suites under -DNDEBUG
 make bench        # the benchmarks reported above (-DNDEBUG; pass a scenario
                   # to the binary: ./benchmark_100k clustered|random|itq)
@@ -389,7 +389,10 @@ against float32 ground truth, graph persistence round-trips (bitwise-identical
 results and surviving tombstones after reload), context isolation plus a
 4-thread concurrency test, delete/restore/filter composition, slot
 reclamation (new-vector serving, no-dangling-edge integrity after churn of
-100 slots, full entry-point turnover, single-node bootstrap), growable
+100 slots, full entry-point turnover, single-node bootstrap), deterministic
+fuzzing of all three format loaders (6,000 mutated/truncated/extended files
+per run, under ASan in CI: rejected files must leave objects empty, accepted
+files must satisfy full structural invariants), growable
 capacity (2x growth with a relocated block, parallel fill of the new region,
 stale-context invalidation, persistence at the new capacity), ITQ invariants
 (orthogonality, exact cosine preservation, monotone objective, determinism,

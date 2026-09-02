@@ -53,15 +53,20 @@ ITQ_HEADERS := ../include/edgevector/itq_rotation.hpp \
                ../include/edgevector/hnsw_graph.hpp \
                ../include/edgevector/quantize_math.hpp
 
+FUZZ_TARGET := test_format_fuzz$(EXE)
+FUZZ_SRC := test_format_fuzz.cpp
+FUZZ_HEADERS := $(wildcard ../include/edgevector/*.hpp)
+
 RELEASE_TARGETS := test_quantize_math_release$(EXE) \
                    test_mmap_storage_release$(EXE) \
                    test_hnsw_graph_release$(EXE) \
                    test_integration_release$(EXE) \
-                   test_itq_rotation_release$(EXE)
+                   test_itq_rotation_release$(EXE) \
+                   test_format_fuzz_release$(EXE)
 
 .PHONY: all run release run-release bench clean
 
-all: $(TARGET) $(STORAGE_TARGET) $(HNSW_TARGET) $(INTEG_TARGET) $(ITQ_TARGET)
+all: $(TARGET) $(STORAGE_TARGET) $(HNSW_TARGET) $(INTEG_TARGET) $(ITQ_TARGET) $(FUZZ_TARGET)
 
 $(TARGET): $(SRC) $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $(SRC) -o $(TARGET)
@@ -78,13 +83,17 @@ $(INTEG_TARGET): $(INTEG_SRC) $(INTEG_HEADERS)
 $(ITQ_TARGET): $(ITQ_SRC) $(ITQ_HEADERS)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $(ITQ_SRC) -o $(ITQ_TARGET)
 
+$(FUZZ_TARGET): $(FUZZ_SRC) $(FUZZ_HEADERS)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(FUZZ_SRC) -o $(FUZZ_TARGET)
+
 # make stops at the first recipe line that exits non-zero, so this fails fast.
-run: $(TARGET) $(STORAGE_TARGET) $(HNSW_TARGET) $(INTEG_TARGET) $(ITQ_TARGET)
+run: $(TARGET) $(STORAGE_TARGET) $(HNSW_TARGET) $(INTEG_TARGET) $(ITQ_TARGET) $(FUZZ_TARGET)
 	$(RUNNER) ./$(TARGET)
 	$(RUNNER) ./$(STORAGE_TARGET)
 	$(RUNNER) ./$(HNSW_TARGET)
 	$(RUNNER) ./$(INTEG_TARGET)
 	$(RUNNER) ./$(ITQ_TARGET)
+	$(RUNNER) ./$(FUZZ_TARGET)
 
 # --- release (-DNDEBUG) -----------------------------------------------------
 
@@ -105,12 +114,16 @@ test_integration_release$(EXE): $(INTEG_SRC) $(INTEG_HEADERS)
 test_itq_rotation_release$(EXE): $(ITQ_SRC) $(ITQ_HEADERS)
 	$(CXX) $(RELEASE_FLAGS) $(INCLUDES) $(ITQ_SRC) -o $@
 
+test_format_fuzz_release$(EXE): $(FUZZ_SRC) $(FUZZ_HEADERS)
+	$(CXX) $(RELEASE_FLAGS) $(INCLUDES) $(FUZZ_SRC) -o $@
+
 run-release: $(RELEASE_TARGETS)
 	$(RUNNER) ./test_quantize_math_release$(EXE)
 	$(RUNNER) ./test_mmap_storage_release$(EXE)
 	$(RUNNER) ./test_hnsw_graph_release$(EXE)
 	$(RUNNER) ./test_integration_release$(EXE)
 	$(RUNNER) ./test_itq_rotation_release$(EXE)
+	$(RUNNER) ./test_format_fuzz_release$(EXE)
 
 # --- benchmark (always -DNDEBUG: assert-enabled numbers are meaningless) ----
 
@@ -124,4 +137,4 @@ bench: $(BENCH_TARGET)
 
 clean:
 	rm -f $(TARGET) $(STORAGE_TARGET) $(HNSW_TARGET) $(INTEG_TARGET) \
-	      $(ITQ_TARGET) $(RELEASE_TARGETS) $(BENCH_TARGET)
+	      $(ITQ_TARGET) $(FUZZ_TARGET) $(RELEASE_TARGETS) $(BENCH_TARGET)
