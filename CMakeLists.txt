@@ -35,9 +35,11 @@ install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 option(EDGEVECTOR_BUILD_EXAMPLES "Build the EdgeVector examples" OFF)
 if(EDGEVECTOR_BUILD_EXAMPLES)
-  add_executable(quickstart examples/quickstart.cpp)
-  target_link_libraries(quickstart PRIVATE edgevector::edgevector)
-  # -march=native activates POPCNT/AVX2 (x86) or NEON codegen; correctness
-  # does not depend on it, speed does.
-  target_compile_options(quickstart PRIVATE -O2 -march=native -Wall -Wextra)
+  foreach(example quickstart itq_pipeline)
+    add_executable(${example} examples/${example}.cpp)
+    target_link_libraries(${example} PRIVATE edgevector::edgevector)
+    # -march=native activates POPCNT/AVX2 (x86) or NEON codegen; correctness
+    # does not depend on it, speed does.
+    target_compile_options(${example} PRIVATE -O2 -march=native -Wall -Wextra)
+  endforeach()
 endif()

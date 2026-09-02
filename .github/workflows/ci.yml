@@ -86,6 +86,7 @@ jobs:
           cmake -B build -DEDGEVECTOR_BUILD_EXAMPLES=ON
           cmake --build build
           ./build/quickstart
+          ./build/itq_pipeline
 
   asan-ubsan:
     name: ASan + UBSan
