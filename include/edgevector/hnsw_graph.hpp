@@ -40,9 +40,17 @@
 //                       memory. Requires the float query alongside the
 //                       quantized one.
 // Both accept an optional caller-owned allow-bitmap (bit id set = id may be
-// returned) and always exclude soft-deleted nodes; filtered-out nodes still
-// route traversal. NOTE: a highly selective filter degrades toward a scan of
-// the reachable graph, as in every filtered-HNSW implementation.
+// returned) and always exclude soft-deleted nodes.
+//
+// FILTERED SEARCH IS SELECTIVITY-ADAPTIVE. A sparse filter makes graph
+// traversal the wrong algorithm: too few eligible nodes ever enter the beam,
+// pruning never engages, and the walk decays toward scanning the reachable
+// graph - expensively and approximately. So when the allowed population is
+// small relative to the beam (popcount(allow) <= 16 * ef; the popcount is a
+// ~microsecond pass over the bitmap), the search switches to a direct scan
+// of the allowed ids, which is both cheaper AND exact - recall 1.0 over the
+// allowed set by construction. Larger filters keep the graph traversal, with
+// filtered-out nodes still routing. Both paths are zero-allocation.
 //
 // DELETION AND SLOT RECLAMATION
 // -----------------------------
@@ -631,7 +639,7 @@ public:
         }
         clamp_kef(k, ef);
 
-        std::uint32_t found = beam_layer0(ctx, q, ef, allow);
+        std::uint32_t found = collect_pool(ctx, q, ef, allow);
         while (found > k) { // keep only the k best
             ctx.res_heap_.pop();
             --found;
@@ -671,7 +679,7 @@ public:
         }
         clamp_kef(k, ef);
 
-        const std::uint32_t found = beam_layer0(ctx, q_bits, ef, allow);
+        const std::uint32_t found = collect_pool(ctx, q_bits, ef, allow);
         if (found == 0u) {
             return 0u;
         }
@@ -738,7 +746,7 @@ public:
         }
         clamp_kef(k, ef);
 
-        const std::uint32_t found = beam_layer0(ctx, q_bits, ef, allow);
+        const std::uint32_t found = collect_pool(ctx, q_bits, ef, allow);
         if (found == 0u) {
             return 0u;
         }
@@ -1303,6 +1311,74 @@ private:
             greedy_descend(q, l, ep, ep_dist);
         }
         return search_layer(ctx, q, ep, ef, 0u, allow, true);
+    }
+
+    // Population of an allow-bitmap over the valid id range (bits beyond
+    // capacity are masked off, whatever the caller left there).
+    std::uint64_t popcount_allow(const std::uint64_t* allow) const noexcept {
+        const std::size_t full = static_cast<std::size_t>(capacity_) / 64u;
+        std::uint64_t total = 0u;
+        for (std::size_t w = 0u; w < full; ++w) {
+            total += static_cast<std::uint64_t>(__builtin_popcountll(allow[w]));
+        }
+        const std::uint32_t rem = capacity_ & 63u;
+        if (rem != 0u) {
+            const std::uint64_t mask = (1ull << rem) - 1ull;
+            total += static_cast<std::uint64_t>(
+                __builtin_popcountll(allow[full] & mask));
+        }
+        return total;
+    }
+
+    // Exact scan over the allowed ids: the optimal strategy for sparse
+    // filters. Fills ctx.res_heap_ with the ef best eligible candidates -
+    // EXACT over the allowed set, since every allowed id is scored. Ids are
+    // visited ascending and ties skip the later id, which reproduces the
+    // (distance, id) selection order of the brute-force baseline exactly.
+    // Zero allocation.
+    std::uint32_t filtered_scan(SearchContext& ctx, const std::uint8_t* q,
+                                std::uint32_t ef,
+                                const std::uint64_t* allow) const noexcept {
+        ctx.res_heap_.clear();
+        const std::size_t words =
+            (static_cast<std::size_t>(capacity_) + 63u) / 64u;
+        const std::uint32_t rem = capacity_ & 63u;
+        for (std::size_t w = 0u; w < words; ++w) {
+            std::uint64_t bits = allow[w];
+            if (rem != 0u && w == words - 1u) {
+                bits &= (1ull << rem) - 1ull;
+            }
+            while (bits != 0ull) {
+                const std::uint64_t low = bits & (0ull - bits);
+                bits ^= low;
+                const std::uint32_t id = static_cast<std::uint32_t>(
+                    w * 64u + static_cast<std::size_t>(__builtin_ctzll(low)));
+                if (levels_[id] == kNotInserted || is_deleted(id)) {
+                    continue;
+                }
+                const std::uint32_t d = distance_to(q, id);
+                if (ctx.res_heap_.size() < ef) {
+                    ctx.res_heap_.push(detail::Candidate{d, id});
+                } else if (d < ctx.res_heap_.top().dist) {
+                    ctx.res_heap_.push(detail::Candidate{d, id});
+                    ctx.res_heap_.pop();
+                }
+            }
+        }
+        return ctx.res_heap_.size();
+    }
+
+    // The candidate-pool collector behind all three search modes: picks the
+    // scan for sparse filters (exact and cheaper), the beam otherwise.
+    std::uint32_t collect_pool(SearchContext& ctx, const std::uint8_t* q,
+                               std::uint32_t ef,
+                               const std::uint64_t* allow) const noexcept {
+        if (allow != nullptr &&
+            popcount_allow(allow) <=
+                static_cast<std::uint64_t>(ef) * 16u) {
+            return filtered_scan(ctx, q, ef, allow);
+        }
+        return beam_layer0(ctx, q, ef, allow);
     }
 
     // Beam search on one layer (Algorithm 2), with result-eligibility
