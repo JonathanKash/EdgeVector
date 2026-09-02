@@ -488,6 +488,56 @@ void test_delete_and_filter(std::size_t dim) {
         }
     }
     check(composed, "deletion and allow-bitmap compose correctly");
+
+    // Sparse filters take the exact-scan path: results must EQUAL the
+    // brute-force top-k over the allowed set, ids and distances both.
+    std::vector<std::uint64_t> sparse((n + 63u) / 64u, 0u);
+    std::vector<std::uint32_t> allowed_ids;
+    for (std::uint32_t id = 4u; id < n; id += 17u) { // ~18 sparse survivors
+        sparse[id >> 6u] |= (1ull << (id & 63u));
+        allowed_ids.push_back(id);
+    }
+    found = graph.search(ctx, q, 10u, 100u, res, sparse.data());
+
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> brute;
+    for (const std::uint32_t id : allowed_ids) {
+        if (graph.is_deleted(id)) {
+            continue;
+        }
+        brute.emplace_back(
+            edgevector::hamming_distance(q, data.record(id), dim), id);
+    }
+    std::sort(brute.begin(), brute.end());
+    bool exact = (found == 10u && brute.size() >= 10u);
+    for (std::uint32_t i = 0; exact && i < found; ++i) {
+        exact = (res[i].id == brute[i].second) &&
+                (res[i].distance == brute[i].first);
+    }
+    check(exact,
+          "sparse filter returns the EXACT brute-force top-10 (scan path)");
+
+    // The re-ranked modes run over the same exact pool.
+    edgevector::ScoredResult sres[10];
+    std::vector<float> qraw(dim, 0.25f); // any float query paired with q bits
+    const std::uint32_t sf = graph.search_reranked(
+        ctx, q, qraw.data(), 10u, 100u, sres, sparse.data());
+    bool subset = (sf == 10u);
+    for (std::uint32_t i = 0; subset && i < sf; ++i) {
+        bool in_allowed = false;
+        for (const std::uint32_t id : allowed_ids) {
+            if (sres[i].id == id) {
+                in_allowed = true;
+                break;
+            }
+        }
+        subset = in_allowed;
+    }
+    check(subset, "re-ranked sparse-filtered results stay within the filter");
+
+    // An empty filter returns nothing, quickly.
+    std::vector<std::uint64_t> empty((n + 63u) / 64u, 0u);
+    check(graph.search(ctx, q, 10u, 100u, res, empty.data()) == 0u,
+          "empty allow-bitmap returns 0 results");
 }
 
 // ---------------------------------------------------------------------------

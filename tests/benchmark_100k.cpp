@@ -371,6 +371,67 @@ void run_scenario(const char* name, bool clustered, bool full_report) {
     }
     std::printf("\n");
     std::fflush(stdout);
+
+    // Filtered search across selectivities (allow every stride-th id).
+    // Recall is measured against the exact brute-force top-10 over the
+    // allowed set; sparse filters take the adaptive exact-scan path.
+    if (full_report) {
+        std::printf("Filtered search (ef = 100, k = 10, 300 queries; recall "
+                    "vs exact filtered ground truth):\n\n");
+        std::printf("| selectivity | allowed ids | recall@10 | mean latency | QPS (1 thread) |\n");
+        std::printf("|---|---|---|---|---|\n");
+        const std::size_t strides[] = {1000u, 100u, 10u}; // 0.1%, 1%, 10%
+        const std::size_t nq = 300;
+        edgevector::SearchContext fctx = graph.make_context();
+        for (const std::size_t stride : strides) {
+            std::vector<std::uint64_t> af((kN + 63u) / 64u, 0u);
+            std::vector<std::uint32_t> allowed;
+            for (std::size_t id = 0; id < kN; id += stride) {
+                af[id >> 6u] |= (1ull << (id & 63u));
+                allowed.push_back(static_cast<std::uint32_t>(id));
+            }
+
+            std::size_t fhits = 0;
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> brute;
+            brute.reserve(allowed.size());
+            double total_s = 0.0;
+            for (std::size_t qi = 0; qi < nq; ++qi) {
+                const std::uint8_t* q = qbase + qi * qstride;
+                t0 = Clock::now();
+                const std::uint32_t found = graph.search(
+                    fctx, q, kK, 100u, results.data(), af.data());
+                total_s += seconds_since(t0);
+
+                brute.clear();
+                for (const std::uint32_t id : allowed) {
+                    brute.emplace_back(
+                        edgevector::hamming_distance(q, data.record(id), kDim),
+                        id);
+                }
+                std::partial_sort(brute.begin(),
+                                  brute.begin() +
+                                      static_cast<std::ptrdiff_t>(kK),
+                                  brute.end());
+                for (std::uint32_t i = 0; i < found; ++i) {
+                    got_ids[i] = results[i].id;
+                }
+                std::uint32_t truth10[kK];
+                for (std::size_t t = 0; t < kK; ++t) {
+                    truth10[t] = brute[t].second;
+                }
+                fhits += overlap10(got_ids, found, truth10);
+            }
+            std::printf("| %.1f%% | %zu | %.3f | %.0f us | %.0f |\n",
+                        100.0 / static_cast<double>(stride), allowed.size(),
+                        static_cast<double>(fhits) /
+                            static_cast<double>(nq * kK),
+                        1.0e6 * total_s / static_cast<double>(nq),
+                        static_cast<double>(nq) / total_s);
+            std::fflush(stdout);
+        }
+        std::printf("\n");
+        std::fflush(stdout);
+    }
 }
 
 // ---------------------------------------------------------------------------
