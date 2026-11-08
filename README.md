@@ -23,11 +23,11 @@ zero dependencies — with a two-stage retrieval pipeline that reaches
   that replace the global `operator new` and require **zero** allocations
 - **Concurrent queries and concurrent construction** — per-thread
   `SearchContext` scratch pools for queries, and a striped-lock parallel
-  build: 100k vectors in **7.9 s on 12 threads vs 64.3 s serial (8.1x)**,
+  build: 100k vectors in **7.6 s on 12 threads vs 25.8 s serial (3.4x)**,
   validated by a full referential-integrity sweep after every parallel build
 - **A fully dynamic index** — soft deletion and filtered search (tombstones
   plus caller-supplied allow-bitmaps, composable, persisted in the graph
-  file); slot reclamation for brand-new vectors in ~2.9 ms at 100k
+  file); slot reclamation for brand-new vectors in ~2.4 ms at 100k
   (`remove` → overwrite bytes → `reinsert`, zero dangling edges by
   construction); and growable capacity (`grow()` extends the id space and
   rebinds a relocated vector block, preserving every existing link)
@@ -35,8 +35,8 @@ zero dependencies — with a two-stage retrieval pipeline that reaches
   scan of the allowed set: recall **1.000** at 7 µs/query for a 0.1% filter
   (faster than unfiltered search), while dense filters keep routed traversal
   (0.998 recall at 10%)
-- **~0.05 s startup at 100k vectors** — mmap the codes, load the prebuilt
-  graph (~1,400x faster than rebuilding)
+- **~0.03 s startup at 100k vectors** — mmap the codes, load the prebuilt
+  graph (~780x faster than rebuilding)
 - **Learned ITQ rotation** for anisotropic (real-embedding-shaped) data:
   +21 recall points at the same beam width, or the same accuracy at a
   fraction of the compute — while preserving cosine exactly
@@ -216,7 +216,7 @@ portability constraints dominate raw throughput**.
    throughput too.)
 3. **Fleet devices that reboot often on tiny RAM budgets** (smart cameras,
    retail edge boxes, on-device RAG caches): mmap the 64 B/vector codes,
-   load the prebuilt graph in ~0.05 s, keep float vectors on flash and touch
+   load the prebuilt graph in ~0.03 s, keep float vectors on flash and touch
    only ~ef of them per query — a ~6 MB working set at 100k × 512-d with
    float-exact results.
 4. **Air-gapped and supply-chain-sensitive builds**: vendor four headers and
@@ -313,7 +313,7 @@ store.open("index.evec");                              // zero-copy mmap
 HNSWGraph graph(store.vector(0), store.record_bytes(),
                 static_cast<std::size_t>(store.dim()),
                 static_cast<std::uint32_t>(store.count()));
-graph.load_graph("index.evhg");                        // ~0.05 s at 100k
+graph.load_graph("index.evhg");                        // ~0.03 s at 100k
 
 // ---- Query (hot path: zero allocation, noexcept) ------------------------
 alignas(8) std::uint8_t q[64];
@@ -339,7 +339,7 @@ graph.restore(42);                         //   still routes; persisted (v2)
 // Slot reclamation: replace a dead slot's vector with a brand-new one.
 graph.remove(42);
 quantize(new_floats, dim, base + 42 * rb); // caller overwrites the bytes...
-graph.reinsert(42);                        // ...then the graph relinks: ~3 ms
+graph.reinsert(42);                        // ...then the graph relinks: ~2.4 ms
                                            //   at 100k, no dangling edges
 
 // Growable capacity: enlarge (or relocate) YOUR vector block first, then
@@ -441,7 +441,7 @@ the ARM run locally under QEMU when no ARM hardware is at hand.
 
 v0.8. Known limitations, in priority order:
 
-1. **Dynamic operations are serial** — `reinsert` (~2.9 ms each at 100k;
+1. **Dynamic operations are serial** — `reinsert` (~2.4 ms each at 100k;
    O(total links) by design, exhaustive unlinking over heuristic repair) and
    `grow` must not run concurrently with queries or builds, and a `grow`
    invalidates outstanding `SearchContext`s (their searches safely return 0
